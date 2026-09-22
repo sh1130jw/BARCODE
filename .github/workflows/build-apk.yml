@@ -39,6 +39,14 @@ jobs:
           cp -r src/assets app/assets
           sed -i '/<manifest /a\    <uses-permission android:name="android.permission.CAMERA" />' app/android/app/src/main/AndroidManifest.xml
           cat app/android/app/src/main/AndroidManifest.xml
+          # google_mlkit_text_recognition only ships the language packs we actually
+          # depend on (Latin script). R8's default release minification trips over
+          # references to the other script recognizers the plugin's common code
+          # mentions, so we turn off code shrinking for this one-off internal build.
+          sed -i 's/minifyEnabled true/minifyEnabled false/' app/android/app/build.gradle
+          sed -i 's/shrinkResources true/shrinkResources false/' app/android/app/build.gradle
+          echo "----- build.gradle (app) -----"
+          cat app/android/app/build.gradle
 
       - name: flutter pub get
         working-directory: app
