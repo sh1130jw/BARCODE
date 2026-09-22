@@ -8,6 +8,7 @@ import '../models/scan_outcome.dart';
 import '../models/scan_record.dart';
 import '../services/excel_export_service.dart';
 import '../services/product_lookup_service.dart';
+import '../services/scan_history_service.dart';
 import '../widgets/product_search_sheet.dart';
 import 'scan_screen.dart';
 
@@ -31,7 +32,62 @@ class _HomeScreenState extends State<HomeScreen> {
   final List<ScanRecord> _records = [];
   final Uuid _uuid = const Uuid();
   final ExcelExportService _exportService = ExcelExportService();
+  final ScanHistoryService _historyService = ScanHistoryService();
   bool _isExporting = false;
+  bool _isHistoryLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHistory();
+  }
+
+  /// 이전에 저장해둔 스캔 기록을 불러옵니다(앱을 껐다 켜도 목록이 남도록).
+  Future<void> _loadHistory() async {
+    final loaded = await _historyService.load(
+      widget.productLookup.findExactBarcode,
+    );
+    if (!mounted) return;
+    setState(() {
+      _records
+        ..clear()
+        ..addAll(loaded);
+      _isHistoryLoaded = true;
+    });
+  }
+
+  /// 스캔 목록이 바뀔 때마다 기기에 저장합니다.
+  void _persist() {
+    // 목록을 아직 불러오는 중일 때는 저장하지 않습니다(빈 목록으로 덮어써서
+    // 기존 저장 기록을 지워버리는 것을 방지).
+    if (!_isHistoryLoaded) return;
+    _historyService.save(_records);
+  }
+
+  Future<void> _confirmClearAll() async {
+    if (_records.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('전체 삭제'),
+        content: Text('저장된 스캔 기록 ${_records.length}건을 모두 삭제할까요?\n(엑셀로 내보내지 않았다면 복구할 수 없습니다)'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('취소'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('전체 삭제'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      setState(() => _records.clear());
+      _persist();
+    }
+  }
 
   Future<void> _openScanner() async {
     final outcome = await Navigator.push<ScanOutcome>(
@@ -55,6 +111,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
       });
+      _persist();
     }
   }
 
@@ -62,6 +119,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _records.removeWhere((r) => r.id == id);
     });
+    _persist();
   }
 
   Future<void> _editRecord(ScanRecord record) async {
@@ -95,6 +153,7 @@ class _HomeScreenState extends State<HomeScreen> {
         // 정확히 일치하는 바코드가 있는 경우에만 다시 연결합니다.
         record.product = widget.productLookup.findExactBarcode(result);
       });
+      _persist();
     }
   }
 
@@ -109,6 +168,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     if (selected != null) {
       setState(() => record.product = selected);
+      _persist();
     }
   }
 
@@ -152,9 +212,16 @@ class _HomeScreenState extends State<HomeScreen> {
             tooltip: '엑셀로 내보내기',
             onPressed: _isExporting ? null : _export,
           ),
+          IconButton(
+            icon: const Icon(Icons.delete_sweep_outlined),
+            tooltip: '전체 삭제',
+            onPressed: _records.isEmpty ? null : _confirmClearAll,
+          ),
         ],
       ),
-      body: _records.isEmpty
+      body: !_isHistoryLoaded
+          ? const Center(child: CircularProgressIndicator())
+          : _records.isEmpty
           ? const Center(
               child: Padding(
                 padding: EdgeInsets.all(24),
