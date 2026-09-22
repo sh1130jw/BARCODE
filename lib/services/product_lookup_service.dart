@@ -164,6 +164,33 @@ class ProductLookupService {
     return null;
   }
 
+  /// [matchItemNo]가 정확히 일치하는 품번을 찾지 못했을 때, OCR 오인식을
+  /// 감안해 편집거리 이내의 가장 가까운 품번을 찾습니다(바코드 전체가 아니라
+  /// 품번/컬러/사이즈가 라벨에 따로 인쇄된 경우를 위한 것입니다).
+  /// 가장 가까운 후보가 여러 실제 품번에 걸쳐 있으면(모호하면) null을
+  /// 반환해서 잘못된 상품을 임의로 고르지 않도록 합니다.
+  String? matchItemNoFuzzy(String token, {int maxDistance = 2}) {
+    final target = _normalizeBarcode(token);
+    if (target.length < 6) return null;
+
+    List<String>? best;
+    int bestDist = maxDistance + 1;
+
+    for (final entry in _itemNoByNormalized.entries) {
+      if ((entry.key.length - target.length).abs() > maxDistance) continue;
+      final dist = _levenshtein(target, entry.key, bestDist);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = entry.value;
+        if (bestDist == 0) break;
+      }
+    }
+    if (best != null && bestDist <= maxDistance && best.length == 1) {
+      return best.first;
+    }
+    return null;
+  }
+
   /// 품번 일부로 검색(수동 검색용). 품명도 함께 검색합니다.
   List<ProductInfo> searchItems(String query, {int limit = 30}) {
     if (query.trim().isEmpty) return const [];
@@ -195,7 +222,15 @@ class ProductLookupService {
     final sortedByLength = [...tokens]
       ..sort((a, b) => b.length.compareTo(a.length));
 
-    for (final t in sortedByLength) {
+    // OCR이 하이픈 등 구분 기호를 다른 문자로 잘못 읽거나 아예 놓쳐서,
+    // 원래 하나였던 코드가 인접한 토큰 두 개로 쪼개지는 경우가 있습니다.
+    // 원문에 나온 순서 그대로 이웃한 토큰들을 이어붙여서도 확인합니다.
+    final joinedCandidates = <String>[];
+    for (var i = 0; i < tokens.length - 1; i++) {
+      joinedCandidates.add(tokens[i] + tokens[i + 1]);
+    }
+
+    for (final t in [...sortedByLength, ...joinedCandidates]) {
       final exact = findExactBarcode(t);
       if (exact != null) {
         return MatchResult(
@@ -206,8 +241,8 @@ class ProductLookupService {
       }
     }
 
-    // 가장 긴 후보 1~2개에 대해서만 근사 매칭 시도 (성능 보호)
-    for (final t in sortedByLength.take(2)) {
+    // 가장 긴 후보 1~2개 + 이어붙인 후보에 대해 근사 매칭 시도 (성능 보호)
+    for (final t in [...sortedByLength.take(2), ...joinedCandidates]) {
       final near = findClosestBarcode(t);
       if (near != null) {
         return MatchResult(
@@ -225,6 +260,18 @@ class ProductLookupService {
       if (matched != null) {
         itemNo = matched;
         break;
+      }
+    }
+
+    // 품번이 정확히 일치하지 않으면, OCR 오인식을 감안해 가장 가까운
+    // 품번을 근사 매칭으로 찾아봅니다(바코드 근사 매칭과 동일한 원리).
+    if (itemNo == null) {
+      for (final t in sortedByLength.take(3)) {
+        final matched = matchItemNoFuzzy(t);
+        if (matched != null) {
+          itemNo = matched;
+          break;
+        }
       }
     }
 
