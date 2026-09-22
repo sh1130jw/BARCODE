@@ -33,6 +33,9 @@ dependencies:
   # 고유 ID 생성
   uuid: ^4.4.0
 
+  # 스캔 목록을 기기에 저장(앱을 껐다 켜도 기록이 남도록)
+  shared_preferences: ^2.2.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
