@@ -1,0 +1,72 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+
+      - name: Scaffold Android project and overlay app source
+        run: |
+          flutter create --platforms=android --org com.sinoon.carelabel app
+          rm -rf app/lib
+          cp -r src/lib app/lib
+          cp src/pubspec.yaml app/pubspec.yaml
+          rm -rf app/assets
+          cp -r src/assets app/assets
+          sed -i '/<manifest /a\    <uses-permission android:name="android.permission.CAMERA" />' app/android/app/src/main/AndroidManifest.xml
+          cat app/android/app/src/main/AndroidManifest.xml
+
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: app
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: care-label-scanner-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish APK to apk-output branch
+        run: |
+          set -e
+          mkdir -p out
+          cp app/build/app/outputs/flutter-apk/app-release.apk out/care_label_scanner.apk
+          cd out
+          git init -q
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git checkout -q -b apk-output
+          git add care_label_scanner.apk
+          git commit -q -m "Build APK from ${GITHUB_SHA}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push -f origin apk-output
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
