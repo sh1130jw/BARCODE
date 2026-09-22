@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
@@ -32,23 +33,59 @@ class _ScanScreenState extends State<ScanScreen> {
   late final Future<void> _initializeControllerFuture;
   final OcrService _ocrService = OcrService();
   bool _isProcessing = false;
+  Offset? _focusPoint;
+  Timer? _focusIndicatorTimer;
 
   @override
   void initState() {
     super.initState();
     _controller = CameraController(
       widget.camera,
-      ResolutionPreset.high,
+      // 케어라벨 글자가 작기 때문에 해상도를 높여서 촬영합니다.
+      // (너무 낮으면 초점/조명이 좋아도 작은 글자의 OCR 정확도가 떨어집니다.)
+      ResolutionPreset.veryHigh,
       enableAudio: false,
     );
-    _initializeControllerFuture = _controller.initialize();
+    _initializeControllerFuture = _controller.initialize().then((_) async {
+      if (!mounted) return;
+      // 라벨처럼 가까운 거리의 작은 글자를 찍을 때는 자동 초점/노출을
+      // 화면 중앙(코드가 위치하는 곳)에 맞추는 것이 인식률에 큰 영향을 줍니다.
+      try {
+        await _controller.setFocusMode(FocusMode.auto);
+        await _controller.setExposureMode(ExposureMode.auto);
+      } catch (_) {
+        // 일부 기기/카메라는 지원하지 않을 수 있으므로 무시합니다.
+      }
+    });
   }
 
   @override
   void dispose() {
     _controller.dispose();
     _ocrService.dispose();
+    _focusIndicatorTimer?.cancel();
     super.dispose();
+  }
+
+  /// 화면을 탭한 위치에 초점/노출을 맞춥니다. 라벨의 작은 글자를 찍을 때
+  /// 자동 초점이 다른 곳(배경, 손가락 등)에 맞아버리는 경우가 많은데,
+  /// 코드 부분을 직접 탭해서 초점을 맞추면 인식률이 크게 좋아집니다.
+  Future<void> _onTapToFocus(TapUpDetails details, BoxConstraints constraints) async {
+    final Offset relative = Offset(
+      details.localPosition.dx / constraints.maxWidth,
+      details.localPosition.dy / constraints.maxHeight,
+    );
+    setState(() => _focusPoint = details.localPosition);
+    _focusIndicatorTimer?.cancel();
+    _focusIndicatorTimer = Timer(const Duration(seconds: 1), () {
+      if (mounted) setState(() => _focusPoint = null);
+    });
+    try {
+      await _controller.setFocusPoint(relative);
+      await _controller.setExposurePoint(relative);
+    } catch (_) {
+      // 일부 기기/카메라는 지원하지 않을 수 있으므로 무시합니다.
+    }
   }
 
   void _finish(String code, ProductInfo? product) {
@@ -380,7 +417,30 @@ class _ScanScreenState extends State<ScanScreen> {
           return Stack(
             fit: StackFit.expand,
             children: [
-              CameraPreview(_controller),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  return GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTapUp: (details) => _onTapToFocus(details, constraints),
+                    child: CameraPreview(_controller),
+                  );
+                },
+              ),
+              if (_focusPoint != null)
+                Positioned(
+                  left: _focusPoint!.dx - 32,
+                  top: _focusPoint!.dy - 32,
+                  child: IgnorePointer(
+                    child: Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.yellow, width: 2),
+                      ),
+                    ),
+                  ),
+                ),
               Align(
                 alignment: Alignment.topCenter,
                 child: SafeArea(
@@ -395,7 +455,7 @@ class _ScanScreenState extends State<ScanScreen> {
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: const Text(
-                      '케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요',
+                      '케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요\n(코드 부분을 탭하면 그 위치에 초점을 맞춥니다)',
                       style: TextStyle(color: Colors.white, fontSize: 13),
                       textAlign: TextAlign.center,
                     ),
