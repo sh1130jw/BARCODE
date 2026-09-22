@@ -1,65 +1,51 @@
-import 'product_info.dart';
+/// `assets/product_barcodes.json`(엑셀 "상품바코드조회" 원본을 변환한 데이터)의
+/// 한 행을 나타내는 모델입니다.
+class ProductInfo {
+  final String itemNo; // 품번
+  final String name; // 품명
+  final String color; // 색상 코드 (예: BU, TL / 없으면 "-")
+  final String size; // 사이즈 코드 (예: F, S, M, 230)
+  final String sizeLabel; // 사이즈표기 (예: FREE, SMALL, MEDIUM)
+  final String barcode; // 바코드 (품번+색상+사이즈 조합)
+  final String category; // 사이즈구분명 (예: 의류(CLOTHES))
+  final String gender; // 성별구분명
+  final int? price; // 최초판매가
+  final int? tagPrice; // 택가
 
-/// 스캔 1건을 나타내는 데이터 모델입니다.
-///
-/// [product]가 있으면 상품 DB와 매칭에 성공한 경우이고,
-/// null이면 코드만 인식(또는 직접 입력)되고 상품명은 아직 연결되지 않은 상태입니다.
-class ScanRecord {
-  final String id;
-  String code;
-  final DateTime scannedAt;
-  String? memo;
-  ProductInfo? product;
-
-  ScanRecord({
-    required this.id,
-    required this.code,
-    required this.scannedAt,
-    this.memo,
-    this.product,
+  ProductInfo({
+    required this.itemNo,
+    required this.name,
+    required this.color,
+    required this.size,
+    required this.sizeLabel,
+    required this.barcode,
+    required this.category,
+    required this.gender,
+    this.price,
+    this.tagPrice,
   });
 
-  bool get isMatched => product != null;
+  factory ProductInfo.fromJson(Map<String, dynamic> json) => ProductInfo(
+        itemNo: (json['itemNo'] ?? '').toString(),
+        name: (json['name'] ?? '').toString(),
+        color: (json['color'] ?? '-').toString(),
+        size: (json['size'] ?? '').toString(),
+        sizeLabel: (json['sizeLabel'] ?? '').toString(),
+        barcode: (json['barcode'] ?? '').toString(),
+        category: (json['category'] ?? '').toString(),
+        gender: (json['gender'] ?? '').toString(),
+        price: json['price'] is int ? json['price'] as int : null,
+        tagPrice: json['tagPrice'] is int ? json['tagPrice'] as int : null,
+      );
 
-  String get displayName => product?.name ?? '(상품명 미확인)';
+  /// 색상이 없는(단일 색상) 상품인지 여부
+  bool get hasColor => color.isNotEmpty && color != '-';
 
-  Map<String, dynamic> toMap() => {
-        'id': id,
-        'code': code,
-        'itemNo': product?.itemNo ?? '',
-        'name': product?.name ?? '',
-        'color': product?.color ?? '',
-        'size': product?.sizeLabel ?? '',
-        'scannedAt': scannedAt.toIso8601String(),
-        'memo': memo ?? '',
-        'matched': isMatched,
-      };
-
-  /// 기기에 저장(영구 보관)하기 위한 직렬화.
-  /// 상품 정보 전체를 저장하지 않고, 매칭됐던 바코드만 저장해뒀다가
-  /// 불러올 때 [ProductLookupService]에서 다시 찾아 연결합니다
-  /// (상품 DB가 갱신돼도 항상 최신 상품명을 보여주기 위함).
-  Map<String, dynamic> toStorageJson() => {
-        'id': id,
-        'code': code,
-        'scannedAt': scannedAt.toIso8601String(),
-        'memo': memo,
-        'barcode': product?.barcode,
-      };
-
-  static ScanRecord fromStorageJson(
-    Map<String, dynamic> json,
-    ProductInfo? Function(String barcode) findByBarcode,
-  ) {
-    final barcode = json['barcode'] as String?;
-    return ScanRecord(
-      id: json['id'] as String,
-      code: json['code'] as String,
-      scannedAt: DateTime.parse(json['scannedAt'] as String),
-      memo: json['memo'] as String?,
-      product: (barcode != null && barcode.isNotEmpty)
-          ? findByBarcode(barcode)
-          : null,
-    );
+  /// 목록/다이얼로그에 보여줄 한 줄 요약
+  String get variantLabel {
+    final parts = <String>[];
+    if (hasColor) parts.add(color);
+    if (sizeLabel.isNotEmpty) parts.add(sizeLabel);
+    return parts.isEmpty ? '' : parts.join(' / ');
   }
 }
