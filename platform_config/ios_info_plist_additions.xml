@@ -1,0 +1,17 @@
+<!--
+  아래 내용을 프로젝트의
+    ios/Runner/Info.plist
+  파일의 최상위 <dict> ... </dict> 안쪽에 추가하세요.
+-->
+
+<key>NSCameraUsageDescription</key>
+<string>케어라벨을 촬영해 코드를 인식하기 위해 카메라 접근 권한이 필요합니다.</string>
+
+<!--
+  참고: ios/Podfile 상단의 platform 버전이 12.0 미만으로 되어 있다면
+  아래와 같이 13.0 이상으로 올려주는 것을 권장합니다.
+
+    platform :ios, '13.0'
+
+  버전을 바꾼 뒤에는 ios 폴더에서 pod install을 다시 실행하세요.
+-->

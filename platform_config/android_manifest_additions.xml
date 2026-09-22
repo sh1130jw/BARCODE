@@ -1,0 +1,22 @@
+<!--
+  아래 내용을 프로젝트의
+    android/app/src/main/AndroidManifest.xml
+  파일에 추가하세요.
+
+  1) <manifest ...> 태그 바로 안쪽(=<application> 태그보다 위)에
+     아래 <uses-permission> 줄을 추가합니다.
+-->
+
+<uses-permission android:name="android.permission.CAMERA" />
+
+<!--
+  2) android/app/build.gradle (또는 build.gradle.kts) 에서
+     minSdkVersion(또는 minSdk)이 21 이상인지 확인하세요.
+     최신 Flutter 템플릿은 기본값이 21 이상이라 대부분 그대로 두면 됩니다.
+
+     defaultConfig {
+         ...
+         minSdkVersion 21   // 또는 minSdk = 21
+         ...
+     }
+-->
