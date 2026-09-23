@@ -32,7 +32,7 @@ class CareLabelScannerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '케어라벨 스캐너',
+      title: 'SINOON',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorSchemeSeed: Colors.indigo,
