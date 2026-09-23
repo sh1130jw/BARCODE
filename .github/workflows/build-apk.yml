@@ -8,6 +8,13 @@ on:
 permissions:
   contents: write
 
+# 커밋을 연달아 여러 번 하면 빌드가 동시에 여러 개 돌면서 예전 커밋의
+# 결과물이 마지막에 덮어써지는 문제가 있었습니다. 새 빌드가 시작되면
+# 진행 중이던 이전 빌드를 취소해서 항상 최신 커밋 결과만 남도록 합니다.
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -38,6 +45,8 @@ jobs:
           rm -rf app/assets
           cp -r src/assets app/assets
           sed -i '/<manifest /a\    <uses-permission android:name="android.permission.CAMERA" />' app/android/app/src/main/AndroidManifest.xml
+          # 휴대폰 홈 화면에 보이는 앱 이름
+          sed -i 's/android:label="[^"]*"/android:label="SINOON"/' app/android/app/src/main/AndroidManifest.xml
           cat app/android/app/src/main/AndroidManifest.xml
 
       - name: flutter pub get
