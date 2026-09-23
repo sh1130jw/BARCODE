@@ -150,8 +150,9 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         record.code = result;
         // 코드를 직접 고쳤다면 기존 매칭이 더 이상 맞지 않을 수 있으니
-        // 정확히 일치하는 바코드가 있는 경우에만 다시 연결합니다.
-        record.product = widget.productLookup.findExactBarcode(result);
+        // 다시 연결합니다(정확히 일치하는 바코드가 없으면 오타/오인식을
+        // 감안한 근사 일치까지 시도).
+        record.product = widget.productLookup.findBestBarcode(result);
       });
       _persist();
     }
