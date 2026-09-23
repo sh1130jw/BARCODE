@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/product_info.dart';
 import '../models/scan_outcome.dart';
@@ -13,15 +15,22 @@ import '../widgets/product_search_sheet.dart';
 /// 카메라로 케어라벨을 촬영하고, OCR로 코드를 인식한 뒤
 /// 상품 DB와 자동 매칭하거나 사용자가 직접 확인/선택하는 화면.
 ///
-/// 확정된 결과를 [ScanOutcome]으로 [Navigator.pop]에 담아 반환합니다.
+/// 확정된 결과는 [onAdd]로 바로 목록에 넣습니다.
+/// - 일반 모드: 한 건 추가하면 화면을 닫고 목록으로 돌아갑니다.
+/// - 연속 스캔 모드: 화면을 닫지 않고 계속 찍을 수 있고, 바코드가 정확히
+///   일치하면 확인 창 없이 진동과 함께 바로 추가됩니다.
 class ScanScreen extends StatefulWidget {
   final CameraDescription camera;
   final ProductLookupService productLookup;
+  final AddResult Function(ScanOutcome outcome) onAdd;
+  final void Function(AddResult result) onUndo;
 
   const ScanScreen({
     super.key,
     required this.camera,
     required this.productLookup,
+    required this.onAdd,
+    required this.onUndo,
   });
 
   @override
@@ -29,6 +38,8 @@ class ScanScreen extends StatefulWidget {
 }
 
 class _ScanScreenState extends State<ScanScreen> {
+  static const _continuousPrefKey = 'continuous_scan_mode';
+
   late final CameraController _controller;
   late final Future<void> _initializeControllerFuture;
   final OcrService _ocrService = OcrService();
@@ -36,9 +47,20 @@ class _ScanScreenState extends State<ScanScreen> {
   Offset? _focusPoint;
   Timer? _focusIndicatorTimer;
 
+  /// 연속 스캔 모드 여부(마지막 설정을 기억합니다).
+  bool _continuousMode = false;
+
+  /// 이번에 스캔 화면을 연 뒤로 추가한 개수(연속 스캔 모드 표시용).
+  int _sessionCount = 0;
+
+  /// 연속 스캔 모드에서 방금 추가한 상품(화면 아래 알림 + 되돌리기용).
+  AddResult? _lastAdded;
+  Timer? _lastAddedTimer;
+
   @override
   void initState() {
     super.initState();
+    _loadContinuousMode();
     _controller = CameraController(
       widget.camera,
       // 케어라벨 글자가 작기 때문에 해상도를 높여서 촬영합니다.
@@ -64,7 +86,26 @@ class _ScanScreenState extends State<ScanScreen> {
     _controller.dispose();
     _ocrService.dispose();
     _focusIndicatorTimer?.cancel();
+    _lastAddedTimer?.cancel();
     super.dispose();
+  }
+
+  Future<void> _loadContinuousMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getBool(_continuousPrefKey) ?? false;
+      if (mounted) setState(() => _continuousMode = saved);
+    } catch (_) {
+      // 설정을 못 읽어도 기본값(일반 모드)으로 동작합니다.
+    }
+  }
+
+  Future<void> _setContinuousMode(bool value) async {
+    setState(() => _continuousMode = value);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_continuousPrefKey, value);
+    } catch (_) {}
   }
 
   /// 화면을 탭한 위치에 초점/노출을 맞춥니다. 라벨의 작은 글자를 찍을 때
@@ -88,9 +129,63 @@ class _ScanScreenState extends State<ScanScreen> {
     }
   }
 
+  /// 확정된 스캔 결과를 목록에 넣습니다.
   void _finish(String code, ProductInfo? product) {
     if (!mounted) return;
-    Navigator.pop(context, ScanOutcome(code: code, product: product));
+    final result = widget.onAdd(ScanOutcome(code: code, product: product));
+    HapticFeedback.mediumImpact();
+
+    if (_continuousMode) {
+      // 화면을 닫지 않고, 아래쪽에 방금 추가한 상품을 잠깐 보여줍니다.
+      _lastAddedTimer?.cancel();
+      setState(() {
+        _sessionCount += 1;
+        _lastAdded = result;
+      });
+      _lastAddedTimer = Timer(const Duration(seconds: 4), () {
+        if (mounted) setState(() => _lastAdded = null);
+      });
+      return;
+    }
+
+    // 일반 모드: 목록 화면으로 돌아가면서 알림을 띄웁니다
+    // (알림은 화면이 바뀌어도 목록 화면에 그대로 이어서 표시됩니다).
+    final onUndo = widget.onUndo;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(_addedMessage(result)),
+        duration: const Duration(seconds: 4),
+        action: SnackBarAction(
+          label: '되돌리기',
+          onPressed: () => onUndo(result),
+        ),
+      ),
+    );
+    Navigator.pop(context);
+  }
+
+  String _addedMessage(AddResult result) {
+    final record = result.record;
+    final variant = record.product?.variantLabel ?? '';
+    final name = variant.isEmpty
+        ? record.displayName
+        : '${record.displayName} ($variant)';
+    return result.merged
+        ? '$name · 이미 있던 상품이라 수량 ${record.quantity}개'
+        : '$name · 목록에 추가';
+  }
+
+  void _undoLastAdded() {
+    final result = _lastAdded;
+    if (result == null) return;
+    widget.onUndo(result);
+    _lastAddedTimer?.cancel();
+    setState(() {
+      _lastAdded = null;
+      if (_sessionCount > 0) _sessionCount -= 1;
+    });
   }
 
   Future<void> _captureAndRecognize() async {
@@ -107,7 +202,13 @@ class _ScanScreenState extends State<ScanScreen> {
       final autoMatch = widget.productLookup.attemptAutoMatch(result.tokens);
 
       if (autoMatch.isMatched) {
-        _showMatchConfirmDialog(autoMatch, result);
+        if (_continuousMode && autoMatch.confidence == MatchConfidence.exact) {
+          // 연속 스캔 모드에서 바코드가 정확히 일치하면 확인 없이 바로 추가.
+          // (근사 일치나 조합 인식처럼 틀릴 여지가 있는 경우는 확인 창을 띄웁니다.)
+          _finish(autoMatch.matchedFrom, autoMatch.product);
+        } else {
+          _showMatchConfirmDialog(autoMatch, result);
+        }
       } else if (autoMatch.isAmbiguous) {
         // 품번은 정확히 인식됐지만 색상/사이즈까지는 특정하지 못한 경우:
         // 바로 옵션 선택 화면을 띄워줍니다.
@@ -397,6 +498,11 @@ class _ScanScreenState extends State<ScanScreen> {
       appBar: AppBar(
         title: const Text('케어라벨 스캔'),
         actions: [
+          const Center(child: Text('연속', style: TextStyle(fontSize: 13))),
+          Switch(
+            value: _continuousMode,
+            onChanged: _setContinuousMode,
+          ),
           IconButton(
             icon: const Icon(Icons.search),
             tooltip: '상품 직접 검색',
@@ -455,14 +561,55 @@ class _ScanScreenState extends State<ScanScreen> {
                       color: Colors.black54,
                       borderRadius: BorderRadius.circular(8),
                     ),
-                    child: const Text(
-                      '케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요\n(코드 부분을 탭하면 그 위치에 초점을 맞춥니다)',
-                      style: TextStyle(color: Colors.white, fontSize: 13),
+                    child: Text(
+                      _continuousMode
+                          ? '연속 스캔 중 · 이번에 $_sessionCount개 추가\n(바코드가 정확히 맞으면 바로 추가되고 진동이 울립니다)'
+                          : '케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요\n(코드 부분을 탭하면 그 위치에 초점을 맞춥니다)',
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
                       textAlign: TextAlign.center,
                     ),
                   ),
                 ),
               ),
+              if (_lastAdded != null)
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Padding(
+                    // 촬영 버튼 위쪽에 표시합니다.
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 150),
+                    child: Material(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+                        child: Row(
+                          children: [
+                            Icon(
+                              _lastAdded!.merged
+                                  ? Icons.exposure_plus_1
+                                  : Icons.check_circle,
+                              color: Colors.greenAccent,
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                _addedMessage(_lastAdded!),
+                                style: const TextStyle(color: Colors.white, fontSize: 14),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: _undoLastAdded,
+                              child: const Text(
+                                '되돌리기',
+                                style: TextStyle(color: Colors.amberAccent),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               Align(
                 alignment: Alignment.bottomCenter,
                 child: Padding(

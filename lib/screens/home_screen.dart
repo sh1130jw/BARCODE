@@ -90,27 +90,121 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openScanner() async {
-    final outcome = await Navigator.push<ScanOutcome>(
+    // 스캔 화면은 결과가 나올 때마다 [_addOutcome]을 직접 호출합니다
+    // (연속 스캔 모드에서는 화면을 닫지 않고 계속 추가하기 때문).
+    await Navigator.push<void>(
       context,
-      MaterialPageRoute<ScanOutcome>(
+      MaterialPageRoute<void>(
         builder: (_) => ScanScreen(
           camera: widget.camera,
           productLookup: widget.productLookup,
+          onAdd: _addOutcome,
+          onUndo: _undoAdd,
         ),
       ),
     );
-    if (outcome != null) {
-      setState(() {
-        _records.insert(
-          0,
-          ScanRecord(
-            id: _uuid.v4(),
-            code: outcome.code,
-            scannedAt: DateTime.now(),
-            product: outcome.product,
+  }
+
+  /// 스캔 결과를 목록에 넣습니다. 이미 같은 상품이 있으면 새 줄을 만들지
+  /// 않고 수량을 1 올린 뒤 맨 위로 올립니다.
+  AddResult _addOutcome(ScanOutcome outcome) {
+    final incoming = ScanRecord(
+      id: _uuid.v4(),
+      code: outcome.code,
+      scannedAt: DateTime.now(),
+      product: outcome.product,
+    );
+    final index = _records.indexWhere((r) => r.mergeKey == incoming.mergeKey);
+
+    final AddResult result;
+    if (index >= 0) {
+      final existing = _records.removeAt(index);
+      existing.quantity += 1;
+      _records.insert(0, existing);
+      result = AddResult(record: existing, merged: true);
+    } else {
+      _records.insert(0, incoming);
+      result = AddResult(record: incoming, merged: false);
+    }
+    if (mounted) setState(() {});
+    _persist();
+    return result;
+  }
+
+  /// 방금 추가한 스캔을 되돌립니다(수량을 올렸던 거면 1 내리고,
+  /// 새로 추가한 줄이면 지웁니다).
+  void _undoAdd(AddResult result) {
+    final record = result.record;
+    final index = _records.indexWhere((r) => r.id == record.id);
+    if (index < 0) return;
+    if (result.merged && record.quantity > 1) {
+      record.quantity -= 1;
+    } else {
+      _records.removeAt(index);
+    }
+    if (mounted) setState(() {});
+    _persist();
+  }
+
+  Future<void> _editQuantity(ScanRecord record) async {
+    var value = record.quantity;
+    final result = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('수량 변경'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                record.displayName,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              if (record.product != null && record.product!.variantLabel.isNotEmpty)
+                Text(
+                  record.product!.variantLabel,
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  IconButton.filledTonal(
+                    icon: const Icon(Icons.remove),
+                    onPressed: value > 1 ? () => setDialogState(() => value -= 1) : null,
+                  ),
+                  SizedBox(
+                    width: 72,
+                    child: Text(
+                      '$value',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  IconButton.filledTonal(
+                    icon: const Icon(Icons.add),
+                    onPressed: () => setDialogState(() => value += 1),
+                  ),
+                ],
+              ),
+            ],
           ),
-        );
-      });
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('취소'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, value),
+              child: const Text('저장'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result != null && result != record.quantity) {
+      setState(() => record.quantity = result);
       _persist();
     }
   }
@@ -198,9 +292,10 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final dateFormat = DateFormat('MM/dd HH:mm:ss');
+    final totalQuantity = _records.fold<int>(0, (sum, r) => sum + r.quantity);
     return Scaffold(
       appBar: AppBar(
-        title: Text('케어라벨 스캔 (${_records.length}건)'),
+        title: Text('스캔 ${_records.length}종 · $totalQuantity개'),
         actions: [
           IconButton(
             icon: _isExporting
@@ -227,7 +322,7 @@ class _HomeScreenState extends State<HomeScreen> {
               child: Padding(
                 padding: EdgeInsets.all(24),
                 child: Text(
-                  '아직 스캔한 코드가 없습니다.\n오른쪽 아래 버튼을 눌러 케어라벨을 촬영하세요.',
+                  '아직 스캔한 코드가 없습니다.\n오른쪽 아래 버튼을 눌러 케어라벨을 촬영하세요.\n\n같은 상품을 여러 번 찍으면 한 줄로 합쳐 수량이 올라가고,\n목록에서 상품을 누르면 수량을 직접 고칠 수 있어요.',
                   textAlign: TextAlign.center,
                 ),
               ),
@@ -239,13 +334,38 @@ class _HomeScreenState extends State<HomeScreen> {
                 final r = _records[index];
                 final p = r.product;
                 return ListTile(
+                  onTap: () => _editQuantity(r),
                   leading: CircleAvatar(
                     backgroundColor: r.isMatched ? null : Colors.orange.shade100,
                     child: Text('${_records.length - index}'),
                   ),
-                  title: Text(
-                    r.displayName,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  title: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          r.displayName,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: r.quantity > 1
+                              ? Theme.of(context).colorScheme.primaryContainer
+                              : Theme.of(context).colorScheme.surfaceContainerHighest,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          '${r.quantity}개',
+                          style: const TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                   subtitle: Text(
                     p != null

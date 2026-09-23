@@ -22,6 +22,7 @@ class ExcelExportService {
       TextCellValue('품명'),
       TextCellValue('색상'),
       TextCellValue('사이즈'),
+      TextCellValue('수량'),
       TextCellValue('인식코드'),
       TextCellValue('매칭여부'),
       TextCellValue('인식일시'),
@@ -38,12 +39,24 @@ class ExcelExportService {
         TextCellValue(p?.name ?? ''),
         TextCellValue(p?.color ?? ''),
         TextCellValue(p?.sizeLabel ?? ''),
+        IntCellValue(r.quantity),
         TextCellValue(r.code),
         TextCellValue(r.isMatched ? 'O' : 'X'),
         TextCellValue(dateFormat.format(r.scannedAt)),
         TextCellValue(r.memo ?? ''),
       ]);
     }
+
+    // 맨 아래에 합계(총 수량) 줄을 넣습니다.
+    final totalQuantity = records.fold<int>(0, (sum, r) => sum + r.quantity);
+    sheet.appendRow(<CellValue?>[
+      TextCellValue('합계'),
+      TextCellValue(''),
+      TextCellValue('${records.length}종'),
+      TextCellValue(''),
+      TextCellValue(''),
+      IntCellValue(totalQuantity),
+    ]);
 
     final bytes = excel.encode();
     if (bytes == null) {
@@ -63,7 +76,8 @@ class ExcelExportService {
     await Share.shareXFiles(
       [XFile(file.path)],
       subject: '케어라벨 스캔 결과',
-      text: '케어라벨 스캔 결과 (${records.length}건)',
+      text: '케어라벨 스캔 결과 (${records.length}종, '
+          '총 ${records.fold<int>(0, (sum, r) => sum + r.quantity)}개)',
     );
   }
 }
