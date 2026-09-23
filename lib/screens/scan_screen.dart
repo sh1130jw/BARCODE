@@ -378,8 +378,9 @@ class _ScanScreenState extends State<ScanScreen> {
                 final value = controller.text.trim();
                 if (value.isEmpty) return;
                 Navigator.pop(dialogContext);
-                // 마지막으로 한 번 더 정확히 일치하는 바코드가 있는지 확인합니다.
-                final product = widget.productLookup.findExactBarcode(value);
+                // 마지막으로 한 번 더 바코드를 확인합니다(정확히 일치하는
+                // 것이 없으면, 오타/오인식을 감안한 근사 일치까지 시도).
+                final product = widget.productLookup.findBestBarcode(value);
                 _finish(value, product);
               },
               child: const Text('목록에 추가'),
