@@ -12,10 +12,11 @@ assets/product_barcodes.json을 새로 만들고, 앱을 다시 빌드하면 됩
     pip install openpyxl
     python3 convert_barcode_xlsx_to_json.py 상품바코드조회.xlsx
 
-원본 엑셀은 다음 컬럼 순서를 갖고 있다고 가정합니다(1행이 헤더):
-    품번, 품명, 색상, 사이즈, 사이즈표기, 바코드, 사이즈구분명,
-    사이즈범위, 사이즈위치, 성별구분명, 최초판매가, 택가, ...
-컬럼 순서가 다르면 아래 COLUMN_INDEX 값을 실제 위치(1부터 시작)에 맞게 수정하세요.
+엑셀 열 순서가 조금씩 바뀌어도(예: 맨 앞에 "바코드구분" 열이 추가되거나,
+"바코드" 열 이름이 "상품코드"로 바뀌는 등) 안정적으로 동작하도록, 열 번호를
+고정하지 않고 "헤더 이름"으로 열을 찾습니다. 헤더 줄도 1행이 아니어도(예:
+1행이 "기본사항/세부사항" 같은 그룹 제목이고 2행이 실제 헤더인 경우) 자동으로
+찾습니다.
 """
 
 import json
@@ -27,29 +28,75 @@ try:
 except ImportError:
     sys.exit("openpyxl이 필요합니다. 먼저 `pip install openpyxl`을 실행하세요.")
 
-# 1부터 시작하는 열 번호 (원본 "상품바코드조회.xlsx" 기준)
-COLUMN_INDEX = {
-    "itemNo": 1,      # 품번
-    "name": 2,        # 품명
-    "color": 3,       # 색상
-    "size": 4,        # 사이즈
-    "sizeLabel": 5,   # 사이즈표기
-    "barcode": 6,     # 바코드
-    "category": 7,    # 사이즈구분명
-    "gender": 10,     # 성별구분명
-    "price": 11,      # 최초판매가
-    "tagPrice": 12,   # 택가
+# 컬럼 데이터 키 -> 엑셀 헤더에 쓰일 수 있는 이름(들). 여러 개를 적어두면
+# 그중 먼저 발견되는 이름을 사용합니다(엑셀 양식이 바뀌어도 대응하기 위함).
+COLUMN_NAME_CANDIDATES = {
+    "itemNo": ["품번"],
+    "name": ["품명"],
+    "color": ["색상"],
+    "size": ["사이즈"],
+    "sizeLabel": ["사이즈표기"],
+    "barcode": ["바코드", "상품코드"],
+    "category": ["사이즈구분명"],
+    "gender": ["성별구분명"],
+    "price": ["최초판매가"],
+    "tagPrice": ["택가"],
 }
+
+REQUIRED_KEYS = ["itemNo", "barcode"]
+
+
+def _find_header_row(ws, max_scan_rows: int = 5):
+    """맨 위 몇 줄 중에서 실제 컬럼 헤더가 있는 행을 찾습니다.
+    ("품번"과 바코드 열 이름 중 하나가 함께 있는 첫 행)"""
+    barcode_names = set(COLUMN_NAME_CANDIDATES["barcode"])
+    for r in range(1, max_scan_rows + 1):
+        values = [str(c.value).strip() if c.value is not None else "" for c in ws[r]]
+        if "품번" in values and any(name in values for name in barcode_names):
+            return r, values
+    raise SystemExit(
+        "엑셀에서 헤더 행을 찾지 못했습니다. 위쪽 5개 행 안에 '품번'과 "
+        "'바코드'(또는 '상품코드') 열 이름이 함께 있는지 확인해주세요."
+    )
+
+
+def _build_column_index(header_values):
+    index = {}
+    missing = []
+    for key, candidates in COLUMN_NAME_CANDIDATES.items():
+        found_col = None
+        for name in candidates:
+            if name in header_values:
+                found_col = header_values.index(name) + 1  # openpyxl은 1부터 시작
+                break
+        if found_col is None:
+            if key in REQUIRED_KEYS:
+                missing.append(key)
+        else:
+            index[key] = found_col
+    if missing:
+        raise SystemExit(f"필수 컬럼을 찾지 못했습니다: {missing}")
+    return index
 
 
 def convert(xlsx_path: str, out_path: str, sheet_name: str | None = None) -> int:
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb[wb.sheetnames[0]]
 
+    header_row, header_values = _find_header_row(ws)
+    column_index = _build_column_index(header_values)
+
+    def clean_text(v) -> str:
+        # 엑셀/XML 변환 과정에서 가끔 섞여 들어오는 "_x000D_" 같은
+        # 캐리지리턴 잔재를 제거합니다.
+        s = str(v)
+        return s.replace("_x000D_", "").strip()
+
     records = []
-    for r in range(2, ws.max_row + 1):
+    for r in range(header_row + 1, ws.max_row + 1):
         def cell(col_key):
-            return ws.cell(row=r, column=COLUMN_INDEX[col_key]).value
+            col = column_index.get(col_key)
+            return ws.cell(row=r, column=col).value if col else None
 
         item_no = cell("itemNo")
         barcode = cell("barcode")
@@ -60,14 +107,14 @@ def convert(xlsx_path: str, out_path: str, sheet_name: str | None = None) -> int
         tag_price = cell("tagPrice")
 
         records.append({
-            "itemNo": str(item_no).strip(),
-            "name": str(cell("name") or "").strip(),
-            "color": str(cell("color") or "-").strip(),
-            "size": str(cell("size") or "").strip(),
-            "sizeLabel": str(cell("sizeLabel") or "").strip(),
-            "barcode": str(barcode).strip(),
-            "category": str(cell("category") or "").strip(),
-            "gender": str(cell("gender") or "").strip(),
+            "itemNo": clean_text(item_no),
+            "name": clean_text(cell("name") or ""),
+            "color": clean_text(cell("color") or "-"),
+            "size": clean_text(cell("size") or ""),
+            "sizeLabel": clean_text(cell("sizeLabel") or ""),
+            "barcode": clean_text(barcode),
+            "category": clean_text(cell("category") or ""),
+            "gender": clean_text(cell("gender") or ""),
             "price": int(price) if isinstance(price, (int, float)) else None,
             "tagPrice": int(tag_price) if isinstance(tag_price, (int, float)) else None,
         })
