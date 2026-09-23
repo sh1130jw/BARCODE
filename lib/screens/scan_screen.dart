@@ -57,6 +57,14 @@ class _ScanScreenState extends State<ScanScreen> {
   AddResult? _lastAdded;
   Timer? _lastAddedTimer;
 
+  /// 줌(확대) 상태. 기기마다 지원 범위가 달라서 카메라를 연 뒤 읽어옵니다.
+  static const _zoomPrefKey = 'scan_zoom_level';
+  double _minZoom = 1.0;
+  double _maxZoom = 1.0;
+  double _currentZoom = 1.0;
+  double _zoomAtPinchStart = 1.0;
+  bool _isPinching = false;
+
   @override
   void initState() {
     super.initState();
@@ -78,6 +86,7 @@ class _ScanScreenState extends State<ScanScreen> {
       } catch (_) {
         // 일부 기기/카메라는 지원하지 않을 수 있으므로 무시합니다.
       }
+      await _initZoom();
     });
   }
 
@@ -106,6 +115,63 @@ class _ScanScreenState extends State<ScanScreen> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_continuousPrefKey, value);
     } catch (_) {}
+  }
+
+  /// 기기의 줌 범위를 읽고, 마지막에 쓰던 배율로 맞춥니다.
+  Future<void> _initZoom() async {
+    try {
+      final minZoom = await _controller.getMinZoomLevel();
+      final maxZoom = await _controller.getMaxZoomLevel();
+      double saved = 1.0;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        saved = prefs.getDouble(_zoomPrefKey) ?? 1.0;
+      } catch (_) {}
+      // 광각(1x 미만)은 라벨 글자가 더 작아져서 쓰지 않습니다.
+      final lower = minZoom > 1.0 ? minZoom : 1.0;
+      final upper = maxZoom < lower ? lower : maxZoom;
+      final start = saved.clamp(lower, upper).toDouble();
+      if (!mounted) return;
+      setState(() {
+        _minZoom = lower;
+        _maxZoom = upper;
+        _currentZoom = start;
+      });
+      if (start != 1.0) {
+        await _controller.setZoomLevel(start);
+      }
+    } catch (_) {
+      // 줌을 지원하지 않는 기기는 1x로만 동작합니다.
+    }
+  }
+
+  /// 배율 버튼에 보여줄 값들(기기가 지원하는 범위 안에서만).
+  List<double> get _zoomPresets {
+    const candidates = [1.0, 2.0, 3.0, 5.0];
+    final presets = candidates.where((z) => z <= _maxZoom + 0.01).toList();
+    return presets.isEmpty ? [1.0] : presets;
+  }
+
+  void _applyZoom(double zoom, {bool save = true}) {
+    final z = zoom.clamp(_minZoom, _maxZoom).toDouble();
+    if ((z - _currentZoom).abs() < 0.01) return;
+    setState(() => _currentZoom = z);
+    _controller.setZoomLevel(z).catchError((_) {});
+    if (save) _saveZoom(z);
+  }
+
+  Future<void> _saveZoom(double zoom) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_zoomPrefKey, zoom);
+    } catch (_) {}
+  }
+
+  String _zoomLabel(double z) {
+    final rounded = (z * 10).round() / 10;
+    return rounded == rounded.roundToDouble()
+        ? '${rounded.toInt()}x'
+        : '${rounded.toStringAsFixed(1)}x';
   }
 
   /// 화면을 탭한 위치에 초점/노출을 맞춥니다. 라벨의 작은 글자를 찍을 때
@@ -492,6 +558,55 @@ class _ScanScreenState extends State<ScanScreen> {
     );
   }
 
+  /// 삼성 카메라처럼 1x · 2x · 3x 버튼을 보여줍니다. 선택된 배율은 노란색으로,
+  /// 손가락으로 확대 중이거나 버튼 사이 배율이면 현재 배율(예: 2.4x)을 표시합니다.
+  Widget _buildZoomBar() {
+    final presets = _zoomPresets;
+    // 현재 배율과 가장 가까운 버튼을 "선택됨"으로 표시합니다.
+    double nearest = presets.first;
+    for (final p in presets) {
+      if ((p - _currentZoom).abs() < (nearest - _currentZoom).abs()) nearest = p;
+    }
+    final onPreset = (nearest - _currentZoom).abs() < 0.05;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.black45,
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: presets.map((p) {
+          final selected = p == nearest;
+          final label = selected && !onPreset ? _zoomLabel(_currentZoom) : _zoomLabel(p);
+          return GestureDetector(
+            onTap: () => _applyZoom(p),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 150),
+              margin: const EdgeInsets.symmetric(horizontal: 3),
+              width: selected ? 48 : 38,
+              height: selected ? 48 : 38,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: selected ? Colors.black87 : Colors.black54,
+              ),
+              child: Text(
+                label,
+                style: TextStyle(
+                  color: selected ? Colors.yellow : Colors.white,
+                  fontSize: selected ? 14 : 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -529,6 +644,21 @@ class _ScanScreenState extends State<ScanScreen> {
                   return GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onTapUp: (details) => _onTapToFocus(details, constraints),
+                    // 두 손가락으로 벌리거나 오므려서 확대/축소
+                    onScaleStart: (_) {
+                      _zoomAtPinchStart = _currentZoom;
+                    },
+                    onScaleUpdate: (details) {
+                      if (details.pointerCount < 2) return;
+                      if (!_isPinching) setState(() => _isPinching = true);
+                      _applyZoom(_zoomAtPinchStart * details.scale, save: false);
+                    },
+                    onScaleEnd: (_) {
+                      if (_isPinching) {
+                        setState(() => _isPinching = false);
+                        _saveZoom(_currentZoom);
+                      }
+                    },
                     child: CameraPreview(_controller),
                   );
                 },
@@ -564,7 +694,7 @@ class _ScanScreenState extends State<ScanScreen> {
                     child: Text(
                       _continuousMode
                           ? '연속 스캔 중 · 이번에 $_sessionCount개 추가\n(바코드가 정확히 맞으면 바로 추가되고 진동이 울립니다)'
-                          : '케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요\n(코드 부분을 탭하면 그 위치에 초점을 맞춥니다)',
+                          : '케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요\n(코드를 탭하면 초점, 너무 가까우면 흐려지니 2x로 조금 떨어져서 찍어보세요)',
                       style: const TextStyle(color: Colors.white, fontSize: 13),
                       textAlign: TextAlign.center,
                     ),
@@ -576,7 +706,7 @@ class _ScanScreenState extends State<ScanScreen> {
                   alignment: Alignment.bottomCenter,
                   child: Padding(
                     // 촬영 버튼 위쪽에 표시합니다.
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 150),
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 200),
                     child: Material(
                       color: Colors.black87,
                       borderRadius: BorderRadius.circular(12),
@@ -608,6 +738,14 @@ class _ScanScreenState extends State<ScanScreen> {
                         ),
                       ),
                     ),
+                  ),
+                ),
+              if (_maxZoom > 1.0)
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Padding(
+                    padding: const EdgeInsets.only(bottom: 140),
+                    child: _buildZoomBar(),
                   ),
                 ),
               Align(
