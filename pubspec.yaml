@@ -36,6 +36,10 @@ dependencies:
   # 스캔 목록을 기기에 저장(앱을 껐다 켜도 기록이 남도록)
   shared_preferences: ^2.2.3
 
+  # 사진에서 코드 부분만 잘라 크게 키워 다시 읽기(자세히 읽기)
+  # (엑셀 패키지와 함께 쓸 수 있는 4.3.x까지로 범위를 고정)
+  image: '>=4.2.0 <4.4.0'
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
