@@ -14,10 +14,32 @@ class OcrResult {
   final List<String> tokens;
   final List<String> candidates;
 
+  /// 인식된 줄(글자와 사진 속 위치). "자세히 읽기"에서 코드가 있는 줄만
+  /// 잘라서 크게 다시 읽을 때 사용합니다.
+  final List<OcrLine> lines;
+
   OcrResult({
     required this.fullText,
     required this.tokens,
     required this.candidates,
+    this.lines = const [],
+  });
+}
+
+/// 사진 속 글자 한 줄과 그 위치(픽셀 단위).
+class OcrLine {
+  final String text;
+  final double left;
+  final double top;
+  final double width;
+  final double height;
+
+  const OcrLine({
+    required this.text,
+    required this.left,
+    required this.top,
+    required this.width,
+    required this.height,
   });
 }
 
@@ -27,18 +49,36 @@ class OcrService {
   final TextRecognizer _recognizer =
       TextRecognizer(script: TextRecognitionScript.latin);
 
-  Future<OcrResult> recognize(File imageFile) async {
-    final inputImage = InputImage.fromFile(imageFile);
+  Future<OcrResult> recognize(File imageFile) =>
+      recognizeInput(InputImage.fromFile(imageFile));
+
+  /// 사진 파일이 아니라 카메라 미리보기 화면(라이브 인식)을 바로 읽을 때 사용합니다.
+  Future<OcrResult> recognizeInput(InputImage inputImage) async {
     final RecognizedText recognizedText =
         await _recognizer.processImage(inputImage);
 
     final tokens = _extractTokens(recognizedText.text);
     final candidates = _selectCandidates(tokens);
 
+    final lines = <OcrLine>[];
+    for (final block in recognizedText.blocks) {
+      for (final line in block.lines) {
+        final box = line.boundingBox;
+        lines.add(OcrLine(
+          text: line.text,
+          left: box.left,
+          top: box.top,
+          width: box.width,
+          height: box.height,
+        ));
+      }
+    }
+
     return OcrResult(
       fullText: recognizedText.text,
       tokens: tokens,
       candidates: candidates,
+      lines: lines,
     );
   }
 
