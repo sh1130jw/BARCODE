@@ -2,13 +2,22 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart'
+    show
+        InputImage,
+        InputImageFormat,
+        InputImageFormatValue,
+        InputImageMetadata,
+        InputImageRotationValue;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/product_info.dart';
 import '../models/scan_outcome.dart';
 import '../services/ocr_service.dart';
+import '../services/precise_ocr.dart';
 import '../services/product_lookup_service.dart';
 import '../widgets/product_search_sheet.dart';
 
@@ -44,6 +53,9 @@ class _ScanScreenState extends State<ScanScreen> {
   late final Future<void> _initializeControllerFuture;
   final OcrService _ocrService = OcrService();
   bool _isProcessing = false;
+
+  /// 자동 재촬영 중일 때 화면 위쪽에 보여줄 안내(예: "다시 읽는 중... (1/2)")
+  String? _statusText;
   Offset? _focusPoint;
   Timer? _focusIndicatorTimer;
 
@@ -65,16 +77,52 @@ class _ScanScreenState extends State<ScanScreen> {
   double _zoomAtPinchStart = 1.0;
   bool _isPinching = false;
 
+  /// 이번 스캔에서 읽힌 글자들. 사용자가 상품을 확정하면 "틀리게 읽힌 글자 ->
+  /// 맞는 상품" 짝을 기억하는 데 씁니다(다음에 같은 라벨을 바로 찾도록).
+  List<String> _lastScanTokens = const [];
+
+  // ---- 라이브 인식(셔터 없이 미리보기 화면을 계속 읽기) ----
+  static const _livePrefKey = 'live_scan_enabled';
+  bool _liveEnabled = true;
+  bool _liveStreamRunning = false;
+  bool _liveBusy = false;
+  DateTime _lastLiveRun = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 방금 추가한 뒤 잠깐 쉬는 시간(같은 라벨을 연달아 넣지 않도록)
+  DateTime _livePausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 최근 몇 번의 화면에서 정확히 읽힌 바코드(없으면 null).
+  /// 서로 다른 두 순간에 같은 바코드가 읽혀야 확정합니다.
+  final List<String?> _liveWindow = [];
+
+  /// 방금 추가한 바코드. 화면에서 한 번 사라졌다가 다시 보여야 또 추가합니다
+  /// (같은 상품 여러 벌을 연속으로 셀 때를 위해 "사라짐"만 확인).
+  String? _liveCooldownBarcode;
+  int _liveCooldownMissFrames = 0;
+
+  /// 라이브로 읽고 있는 글자(화면에 참고용으로 보여줌)
+  String? _liveHint;
+
+  static const Map<DeviceOrientation, int> _deviceOrientationDegrees = {
+    DeviceOrientation.portraitUp: 0,
+    DeviceOrientation.landscapeLeft: 90,
+    DeviceOrientation.portraitDown: 180,
+    DeviceOrientation.landscapeRight: 270,
+  };
+
   @override
   void initState() {
     super.initState();
     _loadContinuousMode();
     _controller = CameraController(
       widget.camera,
-      // 케어라벨 글자가 작기 때문에 해상도를 높여서 촬영합니다.
-      // (너무 낮으면 초점/조명이 좋아도 작은 글자의 OCR 정확도가 떨어집니다.)
-      ResolutionPreset.veryHigh,
+      // 케어라벨 글자가 작고, 구겨지거나 둥글면 글자 모양이 찌그러지기 때문에
+      // 기기가 지원하는 가장 높은 해상도로 찍습니다(예전 1080p보다 글자 한 개에
+      // 들어가는 픽셀이 훨씬 많아져서 인식이 안정적입니다).
+      ResolutionPreset.max,
       enableAudio: false,
+      // 라이브 인식용 미리보기 형식(안드로이드 글자 인식기가 바로 읽는 형식)
+      imageFormatGroup: ImageFormatGroup.nv21,
     );
     _initializeControllerFuture = _controller.initialize().then((_) async {
       if (!mounted) return;
@@ -87,6 +135,8 @@ class _ScanScreenState extends State<ScanScreen> {
         // 일부 기기/카메라는 지원하지 않을 수 있으므로 무시합니다.
       }
       await _initZoom();
+      await _loadLiveEnabled();
+      await _startLive();
     });
   }
 
@@ -167,6 +217,151 @@ class _ScanScreenState extends State<ScanScreen> {
     } catch (_) {}
   }
 
+  Future<void> _loadLiveEnabled() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getBool(_livePrefKey) ?? true;
+      if (mounted) setState(() => _liveEnabled = saved);
+    } catch (_) {}
+  }
+
+  Future<void> _toggleLive() async {
+    final value = !_liveEnabled;
+    setState(() {
+      _liveEnabled = value;
+      _liveHint = null;
+    });
+    if (value) {
+      await _startLive();
+    } else {
+      await _stopLive();
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_livePrefKey, value);
+    } catch (_) {}
+  }
+
+  Future<void> _startLive() async {
+    if (!_liveEnabled || _liveStreamRunning || !mounted) return;
+    if (!_controller.value.isInitialized) return;
+    try {
+      await _controller.startImageStream(_onLiveFrame);
+      _liveStreamRunning = true;
+    } catch (_) {
+      // 이 기기에서 라이브 인식이 안 되면 셔터 방식으로만 동작합니다.
+      _liveStreamRunning = false;
+    }
+  }
+
+  Future<void> _stopLive() async {
+    if (!_liveStreamRunning) return;
+    _liveStreamRunning = false;
+    try {
+      await _controller.stopImageStream();
+    } catch (_) {}
+    // 읽고 있던 화면이 끝날 때까지 잠깐 기다립니다.
+    for (var i = 0; i < 20 && _liveBusy; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+
+  InputImage? _toInputImage(CameraImage image) {
+    try {
+      final sensor = widget.camera.sensorOrientation;
+      final device = _deviceOrientationDegrees[_controller.value.deviceOrientation];
+      if (device == null) return null;
+      final degrees = widget.camera.lensDirection == CameraLensDirection.front
+          ? (sensor + device) % 360
+          : (sensor - device + 360) % 360;
+      final rotation = InputImageRotationValue.fromRawValue(degrees);
+      final raw = image.format.raw;
+      final format = raw is int ? InputImageFormatValue.fromRawValue(raw) : null;
+      if (rotation == null || format != InputImageFormat.nv21) return null;
+      if (image.planes.length != 1) return null;
+      final plane = image.planes.first;
+      return InputImage.fromBytes(
+        bytes: plane.bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: format!,
+          bytesPerRow: plane.bytesPerRow,
+        ),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _onLiveFrame(CameraImage image) {
+    if (!mounted || _liveBusy || _isProcessing || !_liveEnabled) return;
+    // 확인 창이나 후보 목록이 떠 있는 동안에는 읽지 않습니다.
+    final route = ModalRoute.of(context);
+    if (route != null && !route.isCurrent) return;
+    final now = DateTime.now();
+    if (now.isBefore(_livePausedUntil)) return;
+    if (now.difference(_lastLiveRun).inMilliseconds < 250) return;
+    _lastLiveRun = now;
+
+    final input = _toInputImage(image);
+    if (input == null) return;
+    _liveBusy = true;
+    _ocrService.recognizeInput(input).then((result) {
+      if (!mounted || _isProcessing || !_liveEnabled) return;
+      _handleLiveResult(result);
+    }).catchError((_) {}).whenComplete(() {
+      _liveBusy = false;
+    });
+  }
+
+  void _handleLiveResult(OcrResult result) {
+    final match = widget.productLookup
+        .attemptAutoMatch(result.tokens, withSuggestions: false);
+
+    // 라이브에서는 확실한 것만: 바코드가 정확히 일치하거나, 예전에 두 번 이상
+    // 확인해준 기록과 똑같이 읽힌 경우만 셉니다.
+    String? barcode;
+    if (match.isMatched &&
+        (match.confidence == MatchConfidence.exact ||
+            (match.confidence == MatchConfidence.learned &&
+                match.learnedCount >= 2))) {
+      barcode = match.product!.barcode;
+    }
+
+    // 방금 추가한 상품이 아직 화면에 있으면 무시하고, 사라진 게 확인되면 풀어줍니다.
+    if (_liveCooldownBarcode != null) {
+      if (barcode == _liveCooldownBarcode) {
+        _liveCooldownMissFrames = 0;
+        barcode = null;
+      } else {
+        _liveCooldownMissFrames += 1;
+        if (_liveCooldownMissFrames >= 2) _liveCooldownBarcode = null;
+      }
+    }
+
+    _liveWindow.add(barcode);
+    if (_liveWindow.length > 5) _liveWindow.removeAt(0);
+
+    // 화면에 "읽는 중" 글자를 보여줘서, 어느 정도 읽히고 있는지 알 수 있게 합니다.
+    String? hint;
+    for (final c in result.candidates) {
+      final current = hint;
+      if (current == null || c.length > current.length) hint = c;
+    }
+    final newHint = hint;
+    if (newHint != _liveHint) setState(() => _liveHint = newHint);
+
+    if (barcode != null && _liveWindow.where((b) => b == barcode).length >= 2) {
+      _liveWindow.clear();
+      _liveCooldownBarcode = barcode;
+      _liveCooldownMissFrames = 0;
+      _livePausedUntil = DateTime.now().add(const Duration(milliseconds: 1200));
+      _lastScanTokens = const [];
+      _finish(match.product!.barcode, match.product);
+    }
+  }
+
   String _zoomLabel(double z) {
     final rounded = (z * 10).round() / 10;
     return rounded == rounded.roundToDouble()
@@ -198,6 +393,12 @@ class _ScanScreenState extends State<ScanScreen> {
   /// 확정된 스캔 결과를 목록에 넣습니다.
   void _finish(String code, ProductInfo? product) {
     if (!mounted) return;
+    // 이번 스캔에서 틀리게 읽힌 글자가 있었다면, 사용자가 확정한 상품과의 짝을
+    // 기억해둡니다(다음에 같은 라벨이 같은 식으로 틀려도 바로 찾도록).
+    if (product != null && _lastScanTokens.isNotEmpty) {
+      widget.productLookup.learnCorrection(_lastScanTokens, product);
+    }
+    _lastScanTokens = const [];
     final result = widget.onAdd(ScanOutcome(code: code, product: product));
     HapticFeedback.mediumImpact();
 
@@ -254,21 +455,101 @@ class _ScanScreenState extends State<ScanScreen> {
     });
   }
 
+  /// 한 장 찍어서 글자를 읽고, 찍은 사진 파일은 바로 지웁니다.
+  Future<OcrResult> _takeAndRecognize() async {
+    final XFile picture = await _controller.takePicture();
+    try {
+      return await _ocrService.recognize(File(picture.path));
+    } finally {
+      try {
+        await File(picture.path).delete();
+      } catch (_) {}
+    }
+  }
+
+  /// 여러 장에서 읽은 글자를 합칩니다. 장마다 다른 글자가 제대로 읽히는
+  /// 경우가 많아서(구겨진 부분, 빛 반사 위치가 조금씩 달라짐), 합쳐서 보면
+  /// 맞는 상품을 찾을 확률이 올라갑니다.
+  OcrResult _mergeOcr(OcrResult a, OcrResult b) {
+    final seen = <String>{};
+    final candidates = <String>[];
+    for (final c in [...a.candidates, ...b.candidates]) {
+      if (seen.add(c.toUpperCase())) candidates.add(c);
+    }
+    return OcrResult(
+      fullText: '${a.fullText}\n\n${b.fullText}',
+      tokens: [...a.tokens, ...b.tokens],
+      candidates: candidates,
+    );
+  }
+
   Future<void> _captureAndRecognize() async {
     if (_isProcessing) return;
     setState(() => _isProcessing = true);
+    _lastScanTokens = const [];
 
+    String? firstPhotoPath;
     try {
       await _initializeControllerFuture;
-      final XFile picture = await _controller.takePicture();
-      final result = await _ocrService.recognize(File(picture.path));
-
+      await _stopLive(); // 사진을 찍는 동안에는 라이브 인식을 멈춥니다.
+      final firstPhoto = await _controller.takePicture();
+      firstPhotoPath = firstPhoto.path;
+      var result = await _ocrService.recognize(File(firstPhoto.path));
       if (!mounted) return;
+      var autoMatch = widget.productLookup.attemptAutoMatch(result.tokens);
 
-      final autoMatch = widget.productLookup.attemptAutoMatch(result.tokens);
+      // 2단계 "자세히 읽기": 바코드가 정확히 맞지 않으면, 방금 찍은 고해상도
+      // 사진에서 코드가 있는 줄(과 화면 가운데)을 잘라 크게 키우고 대비를
+      // 높여 다시 읽습니다. 새로 찍는 게 아니라서 라벨을 움직여도 괜찮아요.
+      if (autoMatch.confidence != MatchConfidence.exact) {
+        setState(() => _statusText = '자세히 읽는 중...');
+        final precise = await _preciseRecognize(firstPhoto.path, result);
+        if (!mounted) return;
+        if (precise != null) {
+          final preciseMatch =
+              widget.productLookup.attemptAutoMatch(precise.tokens);
+          result = _mergeOcr(result, precise);
+          if (preciseMatch.confidence == MatchConfidence.exact) {
+            autoMatch = preciseMatch;
+          } else {
+            final merged = widget.productLookup.attemptAutoMatch(result.tokens);
+            if (_matchRank(merged) >= _matchRank(autoMatch)) autoMatch = merged;
+          }
+        }
+      }
 
+      // 못 찾았으면 사용자가 다시 누르지 않아도 두 장 더 찍어서 읽어봅니다.
+      // (손떨림, 순간적인 초점, 구겨진 부분의 빛 반사 때문에 한 장에서만
+      // 틀리는 경우가 많습니다.)
+      const maxExtraShots = 2;
+      var extraShot = 0;
+      while (!autoMatch.isMatched &&
+          !autoMatch.isAmbiguous &&
+          extraShot < maxExtraShots) {
+        extraShot += 1;
+        setState(() => _statusText = '다시 읽는 중... ($extraShot/$maxExtraShots)\n라벨을 그대로 비춰주세요');
+        final next = await _takeAndRecognize();
+        if (!mounted) return;
+        final nextMatch = widget.productLookup.attemptAutoMatch(next.tokens);
+        result = _mergeOcr(result, next);
+        if (nextMatch.isMatched || nextMatch.isAmbiguous) {
+          autoMatch = nextMatch;
+          break;
+        }
+        // 지금까지 찍은 사진들의 글자를 모두 합쳐서 다시 찾아봅니다.
+        autoMatch = widget.productLookup.attemptAutoMatch(result.tokens);
+      }
+      if (mounted) setState(() => _statusText = null);
+      // 바코드가 정확히 읽혔으면 바로잡을 게 없으니 기억하지 않습니다.
+      _lastScanTokens = autoMatch.confidence == MatchConfidence.exact
+          ? const []
+          : result.tokens;
+
+      final sureEnough = autoMatch.confidence == MatchConfidence.exact ||
+          (autoMatch.confidence == MatchConfidence.learned &&
+              autoMatch.learnedCount >= 2);
       if (autoMatch.isMatched) {
-        if (_continuousMode && autoMatch.confidence == MatchConfidence.exact) {
+        if (_continuousMode && sureEnough) {
           // 연속 스캔 모드에서 바코드가 정확히 일치하면 확인 없이 바로 추가.
           // (근사 일치나 조합 인식처럼 틀릴 여지가 있는 경우는 확인 창을 띄웁니다.)
           _finish(autoMatch.matchedFrom, autoMatch.product);
@@ -278,9 +559,13 @@ class _ScanScreenState extends State<ScanScreen> {
       } else if (autoMatch.isAmbiguous) {
         // 품번은 정확히 인식됐지만 색상/사이즈까지는 특정하지 못한 경우:
         // 바로 옵션 선택 화면을 띄워줍니다.
-        _openProductSearch(directItemNo: autoMatch.matchedFrom, fallback: result);
+        _openProductSearch(
+          directItemNo: autoMatch.matchedFrom,
+          fallback: result,
+          fallbackSuggestions: autoMatch.suggestions,
+        );
       } else {
-        _showCandidatePicker(result);
+        _showCandidatePicker(result, suggestions: autoMatch.suggestions);
       }
     } catch (e) {
       if (!mounted) return;
@@ -288,7 +573,71 @@ class _ScanScreenState extends State<ScanScreen> {
         SnackBar(content: Text('인식 중 오류가 발생했습니다: $e')),
       );
     } finally {
-      if (mounted) setState(() => _isProcessing = false);
+      if (firstPhotoPath != null) {
+        try {
+          await File(firstPhotoPath).delete();
+        } catch (_) {}
+      }
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+          _statusText = null;
+        });
+        await _startLive();
+      }
+    }
+  }
+
+  /// 매칭 결과의 믿을 만한 정도(클수록 좋음). 여러 결과 중 나은 쪽을 고를 때 사용.
+  int _matchRank(MatchResult m) {
+    if (m.isMatched) {
+      switch (m.confidence) {
+        case MatchConfidence.exact:
+          return 5;
+        case MatchConfidence.components:
+          return 4;
+        case MatchConfidence.learned:
+          return 4;
+        case MatchConfidence.fuzzy:
+          return 3;
+        case MatchConfidence.none:
+          return 1;
+      }
+    }
+    if (m.isAmbiguous) return 2;
+    return 1;
+  }
+
+  /// 사진에서 코드 부분만 잘라 크게 키워 다시 읽습니다(자세히 읽기).
+  /// 조각마다 읽은 글자를 합쳐서 돌려주고, 실패하면 null.
+  Future<OcrResult?> _preciseRecognize(String photoPath, OcrResult first) async {
+    List<String> crops = const [];
+    try {
+      final rects = pickCodeLineRects(first.lines);
+      crops = await compute(makeRecognitionCrops, <String, dynamic>{
+        'path': photoPath,
+        'outDir': File(photoPath).parent.path,
+        'rects': rects,
+      });
+      OcrResult? merged;
+      for (final cropPath in crops) {
+        final r = await _ocrService.recognize(File(cropPath));
+        merged = merged == null ? r : _mergeOcr(merged, r);
+        // 이 조각에서 바코드가 정확히 읽혔으면 더 볼 필요가 없습니다.
+        if (widget.productLookup.attemptAutoMatch(r.tokens).confidence ==
+            MatchConfidence.exact) {
+          break;
+        }
+      }
+      return merged;
+    } catch (_) {
+      return null;
+    } finally {
+      for (final cropPath in crops) {
+        try {
+          await File(cropPath).delete();
+        } catch (_) {}
+      }
     }
   }
 
@@ -300,6 +649,8 @@ class _ScanScreenState extends State<ScanScreen> {
         return '근사 일치 (오인식 보정)';
       case MatchConfidence.components:
         return '품번+색상+사이즈 조합 인식';
+      case MatchConfidence.learned:
+        return '예전에 바로잡은 기록으로 인식';
       case MatchConfidence.none:
         return '';
     }
@@ -336,7 +687,13 @@ class _ScanScreenState extends State<ScanScreen> {
             TextButton(
               onPressed: () {
                 Navigator.pop(dialogContext);
-                _showCandidatePicker(ocrResult);
+                // 방금 보여준 상품을 뺀 나머지 비슷한 후보들을 보여줍니다.
+                _showCandidatePicker(
+                  ocrResult,
+                  suggestions: match.suggestions
+                      .where((s) => s.product.barcode != product.barcode)
+                      .toList(),
+                );
               },
               child: const Text('아니에요, 직접 선택'),
             ),
@@ -353,29 +710,70 @@ class _ScanScreenState extends State<ScanScreen> {
     );
   }
 
-  void _showCandidatePicker(OcrResult result) {
+  void _showCandidatePicker(
+    OcrResult result, {
+    List<ProductSuggestion> suggestions = const [],
+  }) {
+    final hasSuggestions = suggestions.isNotEmpty;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (sheetContext) {
         return SafeArea(
-          child: Padding(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(sheetContext).size.height * 0.85,
+            ),
+            child: SingleChildScrollView(
             padding: const EdgeInsets.all(16),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  '자동으로 상품을 찾지 못했어요',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                Text(
+                  hasSuggestions ? '혹시 이 상품인가요?' : '자동으로 상품을 찾지 못했어요',
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 4),
-                const Text(
-                  '인식된 코드 후보를 고르거나, 상품을 직접 검색해서 연결하세요.',
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                Text(
+                  hasSuggestions
+                      ? '라벨 글자가 일부만 읽혔어요. 맞는 상품을 누르면 바로 추가돼요.'
+                      : '인식된 코드 후보를 고르거나, 상품을 직접 검색해서 연결하세요.',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
                 ),
                 const SizedBox(height: 12),
+                if (hasSuggestions) ...[
+                  ...suggestions.map(
+                    (s) => Card(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      child: ListTile(
+                        title: Text(
+                          s.product.name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        subtitle: Text(
+                          s.product.variantLabel.isEmpty
+                              ? s.product.itemNo
+                              : '${s.product.itemNo} · ${s.product.variantLabel}',
+                        ),
+                        trailing: const Icon(Icons.add_circle_outline),
+                        onTap: () {
+                          Navigator.pop(sheetContext);
+                          _finish(s.product.barcode, s.product);
+                        },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
                 if (result.candidates.isNotEmpty) ...[
+                  const Text(
+                    '읽힌 글자',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 6),
                   Wrap(
                     spacing: 8,
                     runSpacing: 8,
@@ -400,15 +798,26 @@ class _ScanScreenState extends State<ScanScreen> {
                   label: const Text('상품 직접 검색 (품번/품명)'),
                 ),
                 const SizedBox(height: 8),
-                TextButton(
-                  onPressed: () {
-                    Navigator.pop(sheetContext);
-                    _showManualEntryDialog(initialText: '', fullText: result.fullText);
-                  },
-                  child: const Text('코드만 직접 입력'),
+                Row(
+                  children: [
+                    TextButton(
+                      onPressed: () {
+                        Navigator.pop(sheetContext);
+                        _showManualEntryDialog(initialText: '', fullText: result.fullText);
+                      },
+                      child: const Text('코드만 직접 입력'),
+                    ),
+                    const Spacer(),
+                    TextButton.icon(
+                      onPressed: () => Navigator.pop(sheetContext),
+                      icon: const Icon(Icons.camera_alt_outlined, size: 18),
+                      label: const Text('다시 찍기'),
+                    ),
+                  ],
                 ),
               ],
             ),
+          ),
           ),
         );
       },
@@ -472,6 +881,7 @@ class _ScanScreenState extends State<ScanScreen> {
     String initialQuery = '',
     String? directItemNo,
     OcrResult? fallback,
+    List<ProductSuggestion> fallbackSuggestions = const [],
   }) async {
     final selected = await showModalBottomSheet<ProductInfo>(
       context: context,
@@ -486,7 +896,7 @@ class _ScanScreenState extends State<ScanScreen> {
       _finish(selected.barcode, selected);
     } else if (fallback != null && mounted) {
       // 옵션 선택을 취소한 경우, 기존 OCR 결과로 다시 후보를 보여줍니다.
-      _showCandidatePicker(fallback);
+      _showCandidatePicker(fallback, suggestions: fallbackSuggestions);
     }
   }
 
@@ -558,6 +968,17 @@ class _ScanScreenState extends State<ScanScreen> {
     );
   }
 
+  String _hintText() {
+    final session = _continuousMode ? '연속 스캔 · 이번에 $_sessionCount개 추가\n' : '';
+    if (_liveEnabled && _liveStreamRunning) {
+      final reading = _liveHint == null ? '' : '\n읽는 중: $_liveHint';
+      return '$session라벨의 코드를 비추면 자동으로 읽어요'
+          '\n(잘 안 되면 라벨을 펴거나 살짝 기울이고, 셔터를 눌러도 돼요)$reading';
+    }
+    return '$session케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요'
+        '\n(코드를 탭하면 초점, 너무 가까우면 흐려지니 2x로 조금 떨어져서 찍어보세요)';
+  }
+
   /// 삼성 카메라처럼 1x · 2x · 3x 버튼을 보여줍니다. 선택된 배율은 노란색으로,
   /// 손가락으로 확대 중이거나 버튼 사이 배율이면 현재 배율(예: 2.4x)을 표시합니다.
   Widget _buildZoomBar() {
@@ -619,9 +1040,19 @@ class _ScanScreenState extends State<ScanScreen> {
             onChanged: _setContinuousMode,
           ),
           IconButton(
+            icon: Icon(
+              _liveEnabled ? Icons.center_focus_strong : Icons.center_focus_weak,
+            ),
+            tooltip: _liveEnabled ? '자동 인식 끄기' : '자동 인식 켜기',
+            onPressed: _toggleLive,
+          ),
+          IconButton(
             icon: const Icon(Icons.search),
             tooltip: '상품 직접 검색',
-            onPressed: () => _openProductSearch(),
+            onPressed: () {
+              _lastScanTokens = const []; // 스캔과 무관한 검색이라 기억하지 않음
+              _openProductSearch();
+            },
           ),
         ],
       ),
@@ -692,9 +1123,7 @@ class _ScanScreenState extends State<ScanScreen> {
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
-                      _continuousMode
-                          ? '연속 스캔 중 · 이번에 $_sessionCount개 추가\n(바코드가 정확히 맞으면 바로 추가되고 진동이 울립니다)'
-                          : '케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요\n(코드를 탭하면 초점, 너무 가까우면 흐려지니 2x로 조금 떨어져서 찍어보세요)',
+                      _statusText ?? _hintText(),
                       style: const TextStyle(color: Colors.white, fontSize: 13),
                       textAlign: TextAlign.center,
                     ),
