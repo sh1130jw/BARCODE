@@ -89,6 +89,38 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// 틀리게 읽힌 라벨을 바로잡아준 기록(자동으로 쌓임)을 지웁니다.
+  /// 잘못 고른 상품이 기억돼서 계속 엉뚱하게 찾을 때 사용합니다.
+  Future<void> _confirmClearLearned() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('인식 학습 기록 지우기'),
+        content: const Text(
+          '틀리게 읽힌 라벨을 바로잡아준 기록을 모두 지울까요?\n'
+          '스캔 목록은 그대로 남습니다.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('취소'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('지우기'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await widget.productLookup.clearLearned();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('인식 학습 기록을 지웠어요.')),
+      );
+    }
+  }
+
   Future<void> _openScanner() async {
     // 스캔 화면은 결과가 나올 때마다 [_addOutcome]을 직접 호출합니다
     // (연속 스캔 모드에서는 화면을 닫지 않고 계속 추가하기 때문).
@@ -312,6 +344,19 @@ class _HomeScreenState extends State<HomeScreen> {
             icon: const Icon(Icons.delete_sweep_outlined),
             tooltip: '전체 삭제',
             onPressed: _records.isEmpty ? null : _confirmClearAll,
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'clear_learned') _confirmClearLearned();
+            },
+            itemBuilder: (_) => [
+              PopupMenuItem<String>(
+                value: 'clear_learned',
+                child: Text(
+                  '인식 학습 기록 지우기 (${widget.productLookup.learnedCount}건)',
+                ),
+              ),
+            ],
           ),
         ],
       ),
