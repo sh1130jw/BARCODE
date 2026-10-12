@@ -13,6 +13,7 @@ import '../services/excel_export_service.dart';
 import '../services/product_lookup_service.dart';
 import '../services/scan_history_service.dart';
 import '../widgets/product_search_sheet.dart';
+import 'catalog_screen.dart';
 import 'scan_screen.dart';
 
 /// 스캔된 코드/상품 목록을 박스별로 보여주고,
@@ -240,6 +241,32 @@ class _HomeScreenState extends State<HomeScreen> {
           onUndo: _undoAdd,
           currentBox: _currentBox,
           onNextBox: _nextBox,
+        ),
+      ),
+    );
+  }
+
+  /// 우리 상품 전체를 둘러보는 화면. 여기서 고른 상품도 지금 박스에 담을 수 있습니다.
+  Future<void> _openCatalog() async {
+    // 방금 추가한 상품 알림이 떠 있으면 닫고 들어갑니다.
+    ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+    final scanned = <String, int>{};
+    for (final r in _records) {
+      final p = r.product;
+      if (p == null) continue;
+      final key = p.barcode.toUpperCase();
+      scanned[key] = (scanned[key] ?? 0) + r.quantity;
+    }
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => CatalogScreen(
+          productLookup: widget.productLookup,
+          scannedByBarcode: scanned,
+          currentBox: _currentBox,
+          onAdd: (product) =>
+              _addOutcome(ScanOutcome(code: product.barcode, product: product)),
+          onUndo: _undoAdd,
         ),
       ),
     );
@@ -595,21 +622,22 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Row(
           children: [
             const Icon(Icons.inventory_2_outlined, size: 20),
-            const SizedBox(width: 8),
-            const Text('지금 담는 박스', style: TextStyle(fontSize: 13)),
-            const SizedBox(width: 8),
-            InkWell(
-              borderRadius: BorderRadius.circular(8),
-              onTap: _editCurrentBox,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                child: Text(
-                  '${boxLabel(current)} · $count개',
-                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            const SizedBox(width: 6),
+            // 박스 이름을 누르면 번호/이름을 직접 바꿀 수 있습니다.
+            Expanded(
+              child: InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: _editCurrentBox,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                  child: Text(
+                    '${boxLabel(current)} · $count개',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
                 ),
               ),
             ),
-            const Spacer(),
             IconButton(
               icon: const Icon(Icons.chevron_left),
               tooltip: '이전 박스',
@@ -740,6 +768,11 @@ class _HomeScreenState extends State<HomeScreen> {
         title: Text('스캔 ${_records.length}종 · $totalQuantity개'),
         actions: [
           IconButton(
+            icon: const Icon(Icons.menu_book_outlined),
+            tooltip: '상품 목록',
+            onPressed: _openCatalog,
+          ),
+          IconButton(
             icon: _isExporting
                 ? const SizedBox(
                     width: 20,
@@ -757,10 +790,15 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           PopupMenuButton<String>(
             onSelected: (value) {
+              if (value == 'catalog') _openCatalog();
               if (value == 'saved_files') _showSavedFiles();
               if (value == 'clear_learned') _confirmClearLearned();
             },
             itemBuilder: (_) => [
+              const PopupMenuItem<String>(
+                value: 'catalog',
+                child: Text('상품 목록 보기'),
+              ),
               const PopupMenuItem<String>(
                 value: 'saved_files',
                 child: Text('보관함 (내보낸 엑셀 파일)'),
