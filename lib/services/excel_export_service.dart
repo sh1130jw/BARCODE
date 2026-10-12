@@ -7,33 +7,49 @@ import 'package:share_plus/share_plus.dart';
 
 import '../models/scan_record.dart';
 
-/// 스캔 목록을 .xlsx 파일로 만들고 공유(카카오톡/이메일/저장 등)하는 서비스.
-///
-/// 만든 파일은 앱 안에도 남겨두어서 "보관함"에서 다시 보내거나 지울 수 있습니다.
+/// 스캔 목록을 이름을 붙인 .xlsx 파일로 저장하고(보관함),
+/// 저장한 파일을 다시 보내거나(카카오톡/이메일/드라이브 등) 이름을 바꾸고 지우는 서비스.
 class ExcelExportService {
-  /// 박스 순서(1번, 2번, …), 같은 박스 안에서는 스캔한 순서로 정렬합니다.
-  List<ScanRecord> _sortByBox(List<ScanRecord> records) {
-    final sorted = [...records];
-    sorted.sort((a, b) {
-      final byBox = compareBoxes(a.box, b.box);
-      if (byBox != 0) return byBox;
-      return a.scannedAt.compareTo(b.scannedAt);
-    });
-    return sorted;
+  /// 파일 이름에 쓸 수 없는 글자(\ / : * ? " < > |)를 빼고 정리합니다.
+  String cleanName(String name) {
+    var s = name.replaceAll(RegExp(r'[\\/:*?"<>|\n\r\t]'), ' ').trim();
+    s = s.replaceAll(RegExp(r'\s+'), ' ');
+    if (s.toLowerCase().endsWith('.xlsx')) s = s.substring(0, s.length - 5).trim();
+    while (s.startsWith('.')) {
+      s = s.substring(1).trim();
+    }
+    if (s.length > 80) s = s.substring(0, 80).trim();
+    return s;
   }
 
-  Future<File> buildExcelFile(List<ScanRecord> records) async {
-    final excel = Excel.createExcel();
-    final sorted = _sortByBox(records);
+  /// 파일 이름(확장자 뺀 것)
+  String displayName(File file) {
+    final name = file.path.split('/').last;
+    return name.toLowerCase().endsWith('.xlsx') ? name.substring(0, name.length - 5) : name;
+  }
 
-    // ---- 시트 1: 전체 목록(박스 열 포함) ----
+  Future<Directory> _dir() => getApplicationDocumentsDirectory();
+
+  /// 같은 이름이 있으면 "이름 (2)", "이름 (3)" … 으로 피합니다.
+  File _uniqueFile(Directory dir, String base, {File? except}) {
+    var file = File('${dir.path}/$base.xlsx');
+    var n = 2;
+    while (file.existsSync() && (except == null || file.path != except.path)) {
+      file = File('${dir.path}/$base ($n).xlsx');
+      n += 1;
+    }
+    return file;
+  }
+
+  List<int> _buildBytes(List<ScanRecord> records) {
+    final excel = Excel.createExcel();
+
     const sheetName = '스캔목록';
     excel.rename(excel.getDefaultSheet()!, sheetName);
     final Sheet sheet = excel[sheetName];
 
     sheet.appendRow(<CellValue?>[
       TextCellValue('번호'),
-      TextCellValue('박스'),
       TextCellValue('품번'),
       TextCellValue('품명'),
       TextCellValue('색상'),
@@ -46,12 +62,11 @@ class ExcelExportService {
     ]);
 
     final dateFormat = DateFormat('yyyy-MM-dd HH:mm:ss');
-    for (var i = 0; i < sorted.length; i++) {
-      final r = sorted[i];
+    for (var i = 0; i < records.length; i++) {
+      final r = records[i];
       final p = r.product;
       sheet.appendRow(<CellValue?>[
         IntCellValue(i + 1),
-        TextCellValue(boxLabel(r.box)),
         TextCellValue(p?.itemNo ?? ''),
         TextCellValue(p?.name ?? ''),
         TextCellValue(p?.color ?? ''),
@@ -64,43 +79,14 @@ class ExcelExportService {
       ]);
     }
 
-    final totalQuantity = sorted.fold<int>(0, (sum, r) => sum + r.quantity);
+    // 맨 아래에 합계(총 수량) 줄을 넣습니다.
+    final totalQuantity = records.fold<int>(0, (sum, r) => sum + r.quantity);
     sheet.appendRow(<CellValue?>[
       TextCellValue('합계'),
       TextCellValue(''),
+      TextCellValue('${records.length}종'),
       TextCellValue(''),
-      TextCellValue('${sorted.length}종'),
       TextCellValue(''),
-      TextCellValue(''),
-      IntCellValue(totalQuantity),
-    ]);
-
-    // ---- 시트 2: 박스별 합계 ----
-    final Sheet summary = excel['박스별 합계'];
-    summary.appendRow(<CellValue?>[
-      TextCellValue('박스'),
-      TextCellValue('상품 종류'),
-      TextCellValue('수량'),
-    ]);
-    final boxKeys = <String>[];
-    final kinds = <String, int>{};
-    final quantities = <String, int>{};
-    for (final r in sorted) {
-      final key = (r.box ?? '').trim();
-      if (!kinds.containsKey(key)) boxKeys.add(key);
-      kinds[key] = (kinds[key] ?? 0) + 1;
-      quantities[key] = (quantities[key] ?? 0) + r.quantity;
-    }
-    for (final key in boxKeys) {
-      summary.appendRow(<CellValue?>[
-        TextCellValue(boxLabel(key)),
-        IntCellValue(kinds[key] ?? 0),
-        IntCellValue(quantities[key] ?? 0),
-      ]);
-    }
-    summary.appendRow(<CellValue?>[
-      TextCellValue('합계 (${boxKeys.length}박스)'),
-      IntCellValue(sorted.length),
       IntCellValue(totalQuantity),
     ]);
 
@@ -108,29 +94,23 @@ class ExcelExportService {
     if (bytes == null) {
       throw Exception('엑셀 파일 생성에 실패했습니다.');
     }
+    return bytes;
+  }
 
-    final dir = await getApplicationDocumentsDirectory();
-    final fileName =
-        'SINOON_스캔_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.xlsx';
-    final file = File('${dir.path}/$fileName');
+  /// 스캔 목록을 [name] 이름의 엑셀 파일로 보관함에 저장합니다.
+  Future<File> saveNamed(List<ScanRecord> records, String name) async {
+    final base = cleanName(name);
+    if (base.isEmpty) throw Exception('파일 이름을 입력해 주세요.');
+    final bytes = _buildBytes(records);
+    final dir = await _dir();
+    final file = _uniqueFile(dir, base);
     await file.writeAsBytes(bytes, flush: true);
     return file;
   }
 
-  Future<void> exportAndShare(List<ScanRecord> records) async {
-    final file = await buildExcelFile(records);
-    final boxes = records.map((r) => (r.box ?? '').trim()).toSet().length;
-    final total = records.fold<int>(0, (sum, r) => sum + r.quantity);
-    await Share.shareXFiles(
-      [XFile(file.path)],
-      subject: '케어라벨 스캔 결과',
-      text: '케어라벨 스캔 결과 ($boxes박스, ${records.length}종, 총 $total개)',
-    );
-  }
-
-  /// 지금까지 만든 엑셀 파일들(최근 것부터).
+  /// 보관함에 있는 엑셀 파일들(최근 것부터).
   Future<List<File>> listSavedFiles() async {
-    final dir = await getApplicationDocumentsDirectory();
+    final dir = await _dir();
     final files = dir
         .listSync()
         .whereType<File>()
@@ -140,7 +120,20 @@ class ExcelExportService {
     return files;
   }
 
+  /// 파일 이름을 바꿉니다(같은 이름이 있으면 뒤에 (2) 등을 붙입니다).
+  Future<File> rename(File file, String newName) async {
+    final base = cleanName(newName);
+    if (base.isEmpty) throw Exception('파일 이름을 입력해 주세요.');
+    final target = _uniqueFile(file.parent, base, except: file);
+    if (target.path == file.path) return file;
+    return file.rename(target.path);
+  }
+
   Future<void> shareFile(File file) async {
-    await Share.shareXFiles([XFile(file.path)], subject: '케어라벨 스캔 결과');
+    await Share.shareXFiles(
+      [XFile(file.path)],
+      subject: displayName(file),
+      text: '${displayName(file)} (케어라벨 스캔 목록)',
+    );
   }
 }
