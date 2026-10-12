@@ -14,10 +14,6 @@ class ScanRecord {
   /// 같은 상품을 여러 번 스캔하면 줄을 늘리지 않고 이 수량을 올립니다.
   int quantity;
 
-  /// 이 상품을 담은 박스(예: "3" → 3번 박스, 또는 "A-2" 같은 이름).
-  /// 박스 기능 이전에 스캔한 기록은 null(박스 미지정)입니다.
-  String? box;
-
   ScanRecord({
     required this.id,
     required this.code,
@@ -25,7 +21,6 @@ class ScanRecord {
     this.memo,
     this.product,
     this.quantity = 1,
-    this.box,
   });
 
   bool get isMatched => product != null;
@@ -34,13 +29,9 @@ class ScanRecord {
 
   /// 같은 상품인지 판단하는 기준.
   /// 상품이 연결돼 있으면 바코드로, 아니면 인식된 코드 문자열로 비교합니다.
-  /// 같은 박스 안에서만 합칩니다(박스가 다르면 같은 상품이라도 따로 셉니다).
-  String get mergeKey {
-    final item = product != null
-        ? 'P:${product!.barcode.toUpperCase()}'
-        : 'C:${code.trim().toUpperCase()}';
-    return '${(box ?? '').trim()}|$item';
-  }
+  String get mergeKey => product != null
+      ? 'P:${product!.barcode.toUpperCase()}'
+      : 'C:${code.trim().toUpperCase()}';
 
   Map<String, dynamic> toMap() => {
         'id': id,
@@ -50,7 +41,6 @@ class ScanRecord {
         'color': product?.color ?? '',
         'size': product?.sizeLabel ?? '',
         'quantity': quantity,
-        'box': box ?? '',
         'scannedAt': scannedAt.toIso8601String(),
         'memo': memo ?? '',
         'matched': isMatched,
@@ -67,7 +57,6 @@ class ScanRecord {
         'memo': memo,
         'barcode': product?.barcode,
         'quantity': quantity,
-        'box': box,
       };
 
   static ScanRecord fromStorageJson(
@@ -87,32 +76,6 @@ class ScanRecord {
           ? findByBarcode(barcode)
           : null,
       quantity: quantity,
-      box: json['box'] as String?,
     );
   }
-}
-
-/// 박스 번호를 화면·엑셀에 보여줄 이름으로 바꿉니다.
-/// "3" → "3번 박스", "A-2" → "A-2", 비어 있으면 "박스 미지정".
-String boxLabel(String? box) {
-  final b = (box ?? '').trim();
-  if (b.isEmpty) return '박스 미지정';
-  return int.tryParse(b) != null ? '$b번 박스' : b;
-}
-
-/// 박스 정렬 순서: 숫자는 숫자 크기대로(2번이 10번보다 앞), 그다음 이름 순,
-/// 박스 미지정은 맨 뒤.
-int compareBoxes(String? a, String? b) {
-  final x = (a ?? '').trim();
-  final y = (b ?? '').trim();
-  if (x.isEmpty || y.isEmpty) {
-    if (x.isEmpty && y.isEmpty) return 0;
-    return x.isEmpty ? 1 : -1;
-  }
-  final nx = int.tryParse(x);
-  final ny = int.tryParse(y);
-  if (nx != null && ny != null) return nx.compareTo(ny);
-  if (nx != null) return -1;
-  if (ny != null) return 1;
-  return x.compareTo(y);
 }
