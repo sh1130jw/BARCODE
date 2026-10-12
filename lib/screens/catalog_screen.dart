@@ -1,13 +1,12 @@
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show ValueListenable, compute;
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show HapticFeedback, rootBundle;
 import 'package:intl/intl.dart';
 
 import '../models/product_info.dart';
 import '../models/scan_outcome.dart';
-import '../models/scan_record.dart' show boxLabel;
 import '../services/product_lookup_service.dart';
 
 /// 품번 하나(색상·사이즈 변형을 묶은 것)
@@ -91,17 +90,14 @@ enum _CatalogSort { itemNo, itemNoDesc, priceHigh, priceLow, name }
 
 /// 우리 상품 전체를 둘러보는 화면.
 /// 검색(품번·품명·바코드), 종류별 보기, 정렬이 되고, 상품을 누르면
-/// 색상·사이즈별 바코드를 보고 지금 박스에 바로 담을 수도 있습니다.
+/// 색상·사이즈별 바코드를 보고 스캔 목록에 바로 담을 수도 있습니다.
 class CatalogScreen extends StatefulWidget {
   final ProductLookupService productLookup;
 
   /// 지금 스캔 목록에 들어 있는 수량(바코드 대문자 → 수량)
   final Map<String, int> scannedByBarcode;
 
-  /// 지금 담는 박스
-  final ValueListenable<String> currentBox;
-
-  /// 상품을 지금 박스에 담기 / 되돌리기
+  /// 상품을 스캔 목록에 담기 / 되돌리기
   final AddResult Function(ProductInfo product) onAdd;
   final void Function(AddResult result) onUndo;
 
@@ -109,7 +105,6 @@ class CatalogScreen extends StatefulWidget {
     super.key,
     required this.productLookup,
     required this.scannedByBarcode,
-    required this.currentBox,
     required this.onAdd,
     required this.onUndo,
   });
@@ -122,6 +117,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
   static const _assetPath = 'assets/product_barcodes.json';
 
   final TextEditingController _searchController = TextEditingController();
+
+  /// 목록 스크롤(오른쪽 스크롤 막대를 잡고 끌면 빠르게 이동)
+  final ScrollController _listController = ScrollController();
   final NumberFormat _won = NumberFormat('#,###');
 
   List<CatalogItem>? _items;
@@ -148,6 +146,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   @override
   void dispose() {
     _searchController.dispose();
+    _listController.dispose();
     super.dispose();
   }
 
@@ -238,6 +237,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return result;
   }
 
+  /// 검색어·필터·정렬이 바뀌면 목록 맨 위로 올립니다.
+  void _changeFilter(VoidCallback change) {
+    setState(change);
+    if (_listController.hasClients) _listController.jumpTo(0);
+  }
+
   String _priceText(int? price) => price == null ? '' : '${_won.format(price)}원';
 
   String _sortLabel(_CatalogSort s) {
@@ -282,116 +287,116 @@ class _CatalogScreenState extends State<CatalogScreen> {
   // ---------------- 상세 ----------------
 
   Future<void> _openDetail(CatalogItem item) async {
+    final sheetController = ScrollController();
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setSheetState) => SafeArea(
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxHeight: MediaQuery.of(sheetContext).size.height * 0.85,
+        builder: (context, setSheetState) {
+          // 제목부터 옵션 목록까지 전부 한 번에 스크롤됩니다.
+          final children = <Widget>[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+              child: Text(
+                item.name,
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
             ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
-                  child: Text(
-                    item.name,
-                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: SelectableText(
-                    item.itemNo,
-                    style: const TextStyle(fontSize: 14, color: Colors.grey),
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                  child: Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: [
-                      if (item.category.isNotEmpty) _infoChip(item.categoryShort),
-                      if (item.gender.isNotEmpty) _infoChip(shortLabel(item.gender)),
-                      if (item.price != null) _infoChip('판매가 ${_priceText(item.price)}'),
-                      if (item.tagPrice != null && item.tagPrice != item.price)
-                        _infoChip('택가 ${_priceText(item.tagPrice)}'),
-                      _infoChip('옵션 ${item.variants.length}개'),
-                    ],
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                  child: ValueListenableBuilder<String>(
-                    valueListenable: widget.currentBox,
-                    builder: (_, box, __) => Text(
-                      '+ 를 누르면 ${boxLabel(box)}에 바로 담겨요 (택 없는 상품 수기 추가용)',
-                      style: const TextStyle(fontSize: 12, color: Colors.grey),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: SelectableText(
+                item.itemNo,
+                style: const TextStyle(fontSize: 14, color: Colors.grey),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  if (item.category.isNotEmpty) _infoChip(item.categoryShort),
+                  if (item.gender.isNotEmpty) _infoChip(shortLabel(item.gender)),
+                  if (item.price != null) _infoChip('판매가 ${_priceText(item.price)}'),
+                  if (item.tagPrice != null && item.tagPrice != item.price)
+                    _infoChip('택가 ${_priceText(item.tagPrice)}'),
+                  _infoChip('옵션 ${item.variants.length}개'),
+                ],
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 4, 16, 8),
+              child: Text(
+                '+ 를 누르면 스캔 목록에 바로 담겨요 (택 없는 상품 수기 추가용)',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ),
+            const Divider(height: 1),
+          ];
+          for (final v in item.variants) {
+            final key = v.barcode.toUpperCase();
+            final inList = _scanned[key] ?? 0;
+            final added = _addedHere[key]?.length ?? 0;
+            children.add(ListTile(
+              dense: true,
+              title: Text(
+                v.variantLabel.isEmpty ? '단일 옵션' : v.variantLabel,
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+              subtitle: Text(
+                inList > 0 ? '${v.barcode} · 스캔목록 $inList개' : v.barcode,
+              ),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (added > 0) ...[
+                    IconButton(
+                      icon: const Icon(Icons.remove_circle_outline),
+                      tooltip: '방금 담은 것 빼기',
+                      onPressed: () {
+                        _removeAdded(v);
+                        setSheetState(() {});
+                      },
                     ),
-                  ),
-                ),
-                const Divider(height: 1),
-                Flexible(
-                  child: ListView.separated(
-                    shrinkWrap: true,
-                    itemCount: item.variants.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (context, i) {
-                      final v = item.variants[i];
-                      final key = v.barcode.toUpperCase();
-                      final inList = _scanned[key] ?? 0;
-                      final added = _addedHere[key]?.length ?? 0;
-                      return ListTile(
-                        dense: true,
-                        title: Text(
-                          v.variantLabel.isEmpty ? '단일 옵션' : v.variantLabel,
-                          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: Text(
-                          inList > 0 ? '${v.barcode} · 스캔목록 $inList개' : v.barcode,
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (added > 0) ...[
-                              IconButton(
-                                icon: const Icon(Icons.remove_circle_outline),
-                                tooltip: '방금 담은 것 빼기',
-                                onPressed: () {
-                                  _removeAdded(v);
-                                  setSheetState(() {});
-                                },
-                              ),
-                              Text(
-                                '+$added',
-                                style: const TextStyle(fontWeight: FontWeight.bold),
-                              ),
-                            ],
-                            IconButton(
-                              icon: const Icon(Icons.add_circle),
-                              tooltip: '지금 박스에 담기',
-                              onPressed: () {
-                                _add(v);
-                                setSheetState(() {});
-                              },
-                            ),
-                          ],
-                        ),
-                      );
+                    Text(
+                      '+$added',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                  IconButton(
+                    icon: const Icon(Icons.add_circle),
+                    tooltip: '스캔 목록에 담기',
+                    onPressed: () {
+                      _add(v);
+                      setSheetState(() {});
                     },
                   ),
+                ],
+              ),
+            ));
+            children.add(const Divider(height: 1));
+          }
+          children.add(const SizedBox(height: 16));
+
+          return SafeArea(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(sheetContext).size.height * 0.85,
+              ),
+              child: Scrollbar(
+                controller: sheetController,
+                child: ListView(
+                  controller: sheetController,
+                  shrinkWrap: true,
+                  children: children,
                 ),
-                const SizedBox(height: 8),
-              ],
+              ),
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
+    sheetController.dispose();
   }
 
   Widget _infoChip(String text) {
@@ -417,21 +422,21 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ChoiceChip(
             label: const Text('전체'),
             selected: _category == null,
-            onSelected: (_) => setState(() => _category = null),
+            onSelected: (_) => _changeFilter(() => _category = null),
           ),
           for (final c in _categories) ...[
             const SizedBox(width: 6),
             ChoiceChip(
               label: Text(shortLabel(c)),
               selected: _category == c,
-              onSelected: (_) => setState(() => _category = _category == c ? null : c),
+              onSelected: (_) => _changeFilter(() => _category = _category == c ? null : c),
             ),
           ],
           const SizedBox(width: 12),
           FilterChip(
             label: const Text('스캔한 상품만'),
             selected: _onlyScanned,
-            onSelected: (v) => setState(() => _onlyScanned = v),
+            onSelected: (v) => _changeFilter(() => _onlyScanned = v),
           ),
         ],
       ),
@@ -510,13 +515,15 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         icon: const Icon(Icons.clear),
                         onPressed: () {
                           _searchController.clear();
-                          setState(() => _query = '');
+                          _changeFilter(() => _query = '');
                         },
                       ),
                 border: const OutlineInputBorder(),
                 isDense: true,
               ),
-              onChanged: (v) => setState(() => _query = v.trim()),
+              onChanged: (v) {
+                _changeFilter(() => _query = v.trim());
+              },
             ),
           ),
           _buildFilters(),
@@ -540,10 +547,21 @@ class _CatalogScreenState extends State<CatalogScreen> {
           Expanded(
             child: filtered.isEmpty
                 ? const Center(child: Text('조건에 맞는 상품이 없어요.'))
-                : ListView.separated(
-                    itemCount: filtered.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (context, i) => _buildTile(filtered[i]),
+                // 오른쪽에 스크롤 막대가 항상 보이고, 잡고 끌면 빠르게 이동합니다.
+                : Scrollbar(
+                    controller: _listController,
+                    thumbVisibility: true,
+                    interactive: true,
+                    thickness: 8,
+                    radius: const Radius.circular(4),
+                    child: ListView.separated(
+                      controller: _listController,
+                      keyboardDismissBehavior:
+                          ScrollViewKeyboardDismissBehavior.onDrag,
+                      itemCount: filtered.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (context, i) => _buildTile(filtered[i]),
+                    ),
                   ),
           ),
         ],
@@ -558,7 +576,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
             icon: const Icon(Icons.sort),
             tooltip: '정렬',
             initialValue: _sort,
-            onSelected: (s) => setState(() => _sort = s),
+            onSelected: (s) => _changeFilter(() => _sort = s),
             itemBuilder: (_) => _CatalogSort.values
                 .map((s) => PopupMenuItem<_CatalogSort>(
                       value: s,
