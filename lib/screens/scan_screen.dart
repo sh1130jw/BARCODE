@@ -75,8 +75,9 @@ class _ScanScreenState extends State<ScanScreen> {
   int _sessionCount = 0;
 
   /// 연속 스캔 모드에서 방금 추가한 상품(화면 아래 알림 + 되돌리기용).
+  /// 저절로 사라지지 않고, 다음 상품이 추가되거나 사용자가 X/밀어서 지울
+  /// 때까지 떠 있습니다.
   AddResult? _lastAdded;
-  Timer? _lastAddedTimer;
 
   /// 줌(확대) 상태. 기기마다 지원 범위가 달라서 카메라를 연 뒤 읽어옵니다.
   static const _zoomPrefKey = 'scan_zoom_level';
@@ -123,6 +124,14 @@ class _ScanScreenState extends State<ScanScreen> {
   void initState() {
     super.initState();
     _loadContinuousMode();
+    // 목록 화면에 떠 있던 "방금 추가한 상품" 알림은 다음 코드를 찍으러
+    // 들어오면 닫습니다(카메라 화면을 가리지 않도록).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.hideCurrentMaterialBanner();
+      messenger.hideCurrentSnackBar();
+    });
     _controller = CameraController(
       widget.camera,
       // 케어라벨 글자가 작고, 구겨지거나 둥글면 글자 모양이 찌그러지기 때문에
@@ -154,7 +163,6 @@ class _ScanScreenState extends State<ScanScreen> {
     _controller.dispose();
     _ocrService.dispose();
     _focusIndicatorTimer?.cancel();
-    _lastAddedTimer?.cancel();
     super.dispose();
   }
 
@@ -412,34 +420,58 @@ class _ScanScreenState extends State<ScanScreen> {
     HapticFeedback.mediumImpact();
 
     if (_continuousMode) {
-      // 화면을 닫지 않고, 아래쪽에 방금 추가한 상품을 잠깐 보여줍니다.
-      _lastAddedTimer?.cancel();
+      // 화면을 닫지 않고, 아래쪽에 방금 추가한 상품을 보여줍니다.
+      // 다음 상품이 추가되면 그 상품으로 바뀌고, X나 밀어서 지울 수 있습니다.
       setState(() {
         _sessionCount += 1;
         _lastAdded = result;
       });
-      _lastAddedTimer = Timer(const Duration(seconds: 4), () {
-        if (mounted) setState(() => _lastAdded = null);
-      });
       return;
     }
 
-    // 일반 모드: 목록 화면으로 돌아가면서 알림을 띄웁니다
-    // (알림은 화면이 바뀌어도 목록 화면에 그대로 이어서 표시됩니다).
+    // 일반 모드: 목록 화면으로 돌아가면서 위쪽에 알림을 띄웁니다.
+    // 저절로 사라지지 않고, 다음 코드를 찍으러 들어가거나 X/밀어서 지울
+    // 때까지 목록 화면에 그대로 남아 있습니다.
+    _showAddedBanner(result);
+    Navigator.pop(context);
+  }
+
+  /// 목록 화면 위쪽에 "방금 추가한 상품" 알림을 띄웁니다.
+  /// (스캔 화면이 닫힌 뒤에도 동작해야 하므로 context 대신 messenger를 씁니다.)
+  void _showAddedBanner(AddResult result) {
     final onUndo = widget.onUndo;
     final messenger = ScaffoldMessenger.of(context);
+    final message = _addedMessage(result);
     messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(_addedMessage(result)),
-        duration: const Duration(seconds: 4),
-        action: SnackBarAction(
-          label: '되돌리기',
-          onPressed: () => onUndo(result),
+    messenger.removeCurrentMaterialBanner();
+    messenger.showMaterialBanner(
+      MaterialBanner(
+        leading: Icon(
+          result.merged ? Icons.exposure_plus_1 : Icons.check_circle,
+          color: Colors.green,
         ),
+        content: Dismissible(
+          key: ObjectKey(result),
+          direction: DismissDirection.horizontal,
+          onDismissed: (_) => messenger.removeCurrentMaterialBanner(),
+          child: Text(message, style: const TextStyle(fontSize: 14)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              messenger.hideCurrentMaterialBanner();
+              onUndo(result);
+            },
+            child: const Text('되돌리기'),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close),
+            tooltip: '닫기',
+            onPressed: () => messenger.hideCurrentMaterialBanner(),
+          ),
+        ],
       ),
     );
-    Navigator.pop(context);
   }
 
   String _addedMessage(AddResult result) {
@@ -454,11 +486,15 @@ class _ScanScreenState extends State<ScanScreen> {
         : '[$box] $name · 추가';
   }
 
+  void _closeLastAdded() {
+    if (_lastAdded == null) return;
+    setState(() => _lastAdded = null);
+  }
+
   void _undoLastAdded() {
     final result = _lastAdded;
     if (result == null) return;
     widget.onUndo(result);
-    _lastAddedTimer?.cancel();
     setState(() {
       _lastAdded = null;
       if (_sessionCount > 0) _sessionCount -= 1;
@@ -992,13 +1028,15 @@ class _ScanScreenState extends State<ScanScreen> {
             children: [
               const Icon(Icons.inventory_2_outlined, size: 20),
               const SizedBox(width: 8),
-              Text(
-                boxLabel(box),
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              Expanded(
+                child: Text(
+                  '${boxLabel(box)}에 담는 중',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                ),
               ),
-              const SizedBox(width: 6),
-              const Text('에 담는 중', style: TextStyle(fontSize: 13)),
-              const Spacer(),
+              const SizedBox(width: 8),
               FilledButton.tonalIcon(
                 onPressed: () {
                   widget.onNextBox();
@@ -1186,34 +1224,45 @@ class _ScanScreenState extends State<ScanScreen> {
                   child: Padding(
                     // 촬영 버튼 위쪽에 표시합니다.
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 200),
-                    child: Material(
-                      color: Colors.black87,
-                      borderRadius: BorderRadius.circular(12),
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
-                        child: Row(
-                          children: [
-                            Icon(
-                              _lastAdded!.merged
-                                  ? Icons.exposure_plus_1
-                                  : Icons.check_circle,
-                              color: Colors.greenAccent,
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Text(
-                                _addedMessage(_lastAdded!),
-                                style: const TextStyle(color: Colors.white, fontSize: 14),
+                    // 좌우로 밀면 지워집니다.
+                    child: Dismissible(
+                      key: ObjectKey(_lastAdded),
+                      direction: DismissDirection.horizontal,
+                      onDismissed: (_) => _closeLastAdded(),
+                      child: Material(
+                        color: Colors.black87,
+                        borderRadius: BorderRadius.circular(12),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 4, 4, 4),
+                          child: Row(
+                            children: [
+                              Icon(
+                                _lastAdded!.merged
+                                    ? Icons.exposure_plus_1
+                                    : Icons.check_circle,
+                                color: Colors.greenAccent,
                               ),
-                            ),
-                            TextButton(
-                              onPressed: _undoLastAdded,
-                              child: const Text(
-                                '되돌리기',
-                                style: TextStyle(color: Colors.amberAccent),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  _addedMessage(_lastAdded!),
+                                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                                ),
                               ),
-                            ),
-                          ],
+                              TextButton(
+                                onPressed: _undoLastAdded,
+                                child: const Text(
+                                  '되돌리기',
+                                  style: TextStyle(color: Colors.amberAccent),
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: _closeLastAdded,
+                                icon: const Icon(Icons.close, color: Colors.white70),
+                                tooltip: '닫기',
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
