@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show ValueListenable, compute;
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart'
@@ -16,7 +16,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/product_info.dart';
 import '../models/scan_outcome.dart';
-import '../models/scan_record.dart' show boxLabel;
 import '../services/ocr_service.dart';
 import '../services/precise_ocr.dart';
 import '../services/product_lookup_service.dart';
@@ -35,20 +34,12 @@ class ScanScreen extends StatefulWidget {
   final AddResult Function(ScanOutcome outcome) onAdd;
   final void Function(AddResult result) onUndo;
 
-  /// 지금 담는 박스(목록 화면과 같이 바뀝니다)
-  final ValueListenable<String> currentBox;
-
-  /// "다음 박스"를 눌렀을 때(카메라를 닫지 않고 바로 다음 박스로)
-  final VoidCallback onNextBox;
-
   const ScanScreen({
     super.key,
     required this.camera,
     required this.productLookup,
     required this.onAdd,
     required this.onUndo,
-    required this.currentBox,
-    required this.onNextBox,
   });
 
   @override
@@ -480,10 +471,9 @@ class _ScanScreenState extends State<ScanScreen> {
     final name = variant.isEmpty
         ? record.displayName
         : '${record.displayName} ($variant)';
-    final box = boxLabel(record.box);
     return result.merged
-        ? '[$box] $name · 수량 ${record.quantity}개'
-        : '[$box] $name · 추가';
+        ? '$name · 수량 ${record.quantity}개'
+        : '$name · 목록에 추가';
   }
 
   void _closeLastAdded() {
@@ -1014,44 +1004,6 @@ class _ScanScreenState extends State<ScanScreen> {
     );
   }
 
-  /// 지금 담는 박스와 "다음 박스" 버튼. 박스를 다 채우면 카메라를 닫지 않고
-  /// 바로 다음 박스로 넘어갈 수 있습니다.
-  Widget _buildBoxBar() {
-    final scheme = Theme.of(context).colorScheme;
-    return Material(
-      color: scheme.secondaryContainer,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 4, 8, 4),
-        child: ValueListenableBuilder<String>(
-          valueListenable: widget.currentBox,
-          builder: (context, box, _) => Row(
-            children: [
-              const Icon(Icons.inventory_2_outlined, size: 20),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '${boxLabel(box)}에 담는 중',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton.tonalIcon(
-                onPressed: () {
-                  widget.onNextBox();
-                  HapticFeedback.selectionClick();
-                },
-                icon: const Icon(Icons.arrow_forward, size: 18),
-                label: const Text('다음 박스'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   String _hintText() {
     final session = _continuousMode ? '연속 스캔 · 이번에 $_sessionCount개 추가\n' : '';
     if (_liveEnabled && _liveStreamRunning) {
@@ -1139,10 +1091,6 @@ class _ScanScreenState extends State<ScanScreen> {
             },
           ),
         ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(48),
-          child: _buildBoxBar(),
-        ),
       ),
       body: FutureBuilder<void>(
         future: _initializeControllerFuture,
