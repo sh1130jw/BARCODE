@@ -104,6 +104,25 @@ class _ScanScreenState extends State<ScanScreen> {
   /// 라이브로 읽고 있는 글자(화면에 참고용으로 보여줌)
   String? _liveHint;
 
+  // ---- 확실히 안 읽힐 때 "이 중에 있나요?" 선택 창 ----
+  /// 여러 화면에 걸쳐 모은 후보 상품 점수(한 화면만 보고 고르면 읽을 때마다
+  /// 결과가 왔다갔다 하므로, 여러 번 반복해서 나온 상품일수록 점수가 올라갑니다).
+  final Map<String, _LiveVote> _votes = {};
+
+  /// 코드 같은 글자가 보이기 시작했는데 아직 확정이 안 된 시각과 화면 수
+  DateTime? _unsureSince;
+  int _unsureFrames = 0;
+  int _noCodeFrames = 0;
+
+  /// 최근 몇 화면에서 읽힌 글자(선택한 상품과 함께 기억해서 다음엔 바로 찾도록)
+  final List<List<String>> _recentTokenFrames = [];
+
+  /// 지금 화면에 띄운 선택 창의 후보(null이면 창이 닫혀 있음)
+  List<ProductInfo>? _livePicks;
+
+  /// 화면을 탭해서 초점을 고정했는지(가까이서 찍을 때 초점이 왔다갔다 하는 것 방지)
+  bool _focusLocked = false;
+
   static const Map<DeviceOrientation, int> _deviceOrientationDegrees = {
     DeviceOrientation.portraitUp: 0,
     DeviceOrientation.landscapeLeft: 90,
@@ -238,7 +257,9 @@ class _ScanScreenState extends State<ScanScreen> {
     setState(() {
       _liveEnabled = value;
       _liveHint = null;
+      _livePicks = null;
     });
+    _resetUnsure();
     if (value) {
       await _startLive();
     } else {
@@ -324,11 +345,11 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 
   void _handleLiveResult(OcrResult result) {
-    final match = widget.productLookup
-        .attemptAutoMatch(result.tokens, withSuggestions: false);
+    final lookup = widget.productLookup;
+    final match = lookup.attemptAutoMatch(result.tokens, withSuggestions: false);
 
-    // 라이브에서는 확실한 것만: 바코드가 정확히 일치하거나, 예전에 두 번 이상
-    // 확인해준 기록과 똑같이 읽힌 경우만 셉니다.
+    // 자동으로 바로 넣는 건 확실한 것만: 바코드가 정확히 일치하거나, 예전에
+    // 두 번 이상 확인해준 기록과 똑같이 읽힌 경우만 셉니다.
     String? barcode;
     if (match.isMatched &&
         (match.confidence == MatchConfidence.exact ||
@@ -337,28 +358,31 @@ class _ScanScreenState extends State<ScanScreen> {
       barcode = match.product!.barcode;
     }
 
-    // 방금 추가한 상품이 아직 화면에 있으면 무시하고, 사라진 게 확인되면 풀어줍니다.
-    if (_liveCooldownBarcode != null) {
-      if (barcode == _liveCooldownBarcode) {
+    // 확실하지 않을 때만 비슷한 상품 후보를 구합니다(선택 창용).
+    final hasCode = result.candidates.isNotEmpty;
+    final suggestions = barcode == null && hasCode
+        ? lookup.suggestProducts(result.tokens, limit: 5)
+        : const <ProductSuggestion>[];
+
+    // 방금 추가한 상품이 아직 화면에 있으면 무시합니다. 글자가 한 번 덜 읽혔다고
+    // 바로 풀어주면 같은 라벨이 또 들어가므로, 그 상품이 화면에서 정말 사라진
+    // 게 몇 번 확인될 때만 풀어줍니다.
+    final cooldown = _liveCooldownBarcode;
+    if (cooldown != null) {
+      final stillThere = barcode == cooldown ||
+          match.product?.barcode == cooldown ||
+          suggestions.any((sg) => sg.product.barcode == cooldown);
+      if (stillThere) {
         _liveCooldownMissFrames = 0;
-        barcode = null;
+        if (barcode == cooldown) barcode = null;
       } else {
         _liveCooldownMissFrames += 1;
-        if (_liveCooldownMissFrames >= 2) _liveCooldownBarcode = null;
+        if (_liveCooldownMissFrames >= 4) _liveCooldownBarcode = null;
       }
     }
 
     _liveWindow.add(barcode);
     if (_liveWindow.length > 5) _liveWindow.removeAt(0);
-
-    // 화면에 "읽는 중" 글자를 보여줘서, 어느 정도 읽히고 있는지 알 수 있게 합니다.
-    String? hint;
-    for (final c in result.candidates) {
-      final current = hint;
-      if (current == null || c.length > current.length) hint = c;
-    }
-    final newHint = hint;
-    if (newHint != _liveHint) setState(() => _liveHint = newHint);
 
     if (barcode != null && _liveWindow.where((b) => b == barcode).length >= 2) {
       _liveWindow.clear();
@@ -366,8 +390,148 @@ class _ScanScreenState extends State<ScanScreen> {
       _liveCooldownMissFrames = 0;
       _livePausedUntil = DateTime.now().add(const Duration(milliseconds: 1200));
       _lastScanTokens = const [];
+      _resetUnsure();
+      if (_livePicks != null || _liveHint != null) {
+        setState(() {
+          _livePicks = null;
+          _liveHint = null;
+        });
+      }
       _finish(match.product!.barcode, match.product);
+      return;
     }
+
+    // ---- 정확히 안 읽히는 동안: 여러 화면의 후보를 모아서 선택 창 준비 ----
+    if (_liveCooldownBarcode == null && _livePicks == null && barcode == null) {
+      if (hasCode) {
+        _noCodeFrames = 0;
+        _unsureSince ??= DateTime.now();
+        _unsureFrames += 1;
+        _recentTokenFrames.add(result.tokens);
+        if (_recentTokenFrames.length > 4) _recentTokenFrames.removeAt(0);
+
+        // 오래된 화면의 점수는 조금씩 줄여서 지금 보이는 라벨 위주로
+        for (final v in _votes.values) {
+          v.score *= 0.85;
+        }
+        _votes.removeWhere((_, v) => v.score < 0.05);
+
+        if (match.isMatched) _addVote(match.product!, 3);
+        for (var i = 0; i < suggestions.length; i++) {
+          final sg = suggestions[i];
+          var w = 1 - sg.score / 0.35;
+          if (w <= 0) continue;
+          if (i == 0) w += 0.5;
+          _addVote(sg.product, w);
+        }
+        if (match.isAmbiguous && match.ambiguousVariants.length <= 6) {
+          for (final v in match.ambiguousVariants) {
+            _addVote(v, 0.5);
+          }
+        }
+        _maybeShowPicks();
+      } else {
+        _noCodeFrames += 1;
+        if (_noCodeFrames >= 3) _resetUnsure();
+      }
+    }
+
+    // 화면 위쪽 안내: 읽을 때마다 바뀌는 글자 대신, 여러 번 모아서 가장 유력한
+    // 상품을 보여줍니다(없으면 읽힌 글자).
+    String? hint;
+    final top = _topVotes(1);
+    if (top.isNotEmpty) {
+      final p = top.first;
+      hint = p.variantLabel.isEmpty ? p.itemNo : '${p.itemNo} ${p.variantLabel}';
+    } else {
+      for (final c in result.candidates) {
+        final current = hint;
+        if (current == null || c.length > current.length) hint = c;
+      }
+    }
+    final newHint = hint;
+    if (newHint != _liveHint) setState(() => _liveHint = newHint);
+  }
+
+  void _addVote(ProductInfo product, double weight) {
+    final v = _votes.putIfAbsent(product.barcode, () => _LiveVote(product));
+    v.score += weight;
+    v.hits += 1;
+  }
+
+  /// 여러 번 나왔고 점수가 충분한 후보들(점수 높은 순)
+  List<ProductInfo> _topVotes(int limit) {
+    final ranked = _votes.values
+        .where((v) => v.hits >= 2 && v.score >= 0.3)
+        .toList()
+      ..sort((a, b) => b.score.compareTo(a.score));
+    return ranked.take(limit).map((v) => v.product).toList();
+  }
+
+  /// 코드가 보인 지 2초가 넘도록 확정이 안 되면 선택 창을 띄웁니다.
+  void _maybeShowPicks() {
+    final since = _unsureSince;
+    if (since == null || _livePicks != null) return;
+    if (_unsureFrames < 4) return;
+    if (DateTime.now().difference(since).inMilliseconds < 2000) return;
+    final picks = _topVotes(4);
+    if (picks.isEmpty) return;
+    HapticFeedback.lightImpact();
+    setState(() => _livePicks = picks);
+  }
+
+  void _resetUnsure() {
+    _votes.clear();
+    _unsureSince = null;
+    _unsureFrames = 0;
+    _noCodeFrames = 0;
+    _recentTokenFrames.clear();
+  }
+
+  /// 최근 몇 화면에서 읽힌 글자(중복 제거)
+  List<String> _recentTokens() {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final frame in _recentTokenFrames) {
+      for (final t in frame) {
+        if (seen.add(t.toUpperCase())) out.add(t);
+      }
+    }
+    return out;
+  }
+
+  /// 선택 창에서 상품을 골랐을 때
+  void _pickLive(ProductInfo product) {
+    final tokens = _recentTokens();
+    _resetUnsure();
+    setState(() {
+      _livePicks = null;
+      _liveHint = null;
+    });
+    // 같은 라벨이 화면에 남아 있는 동안 다시 묻지 않도록
+    _liveCooldownBarcode = product.barcode;
+    _liveCooldownMissFrames = 0;
+    _liveWindow.clear();
+    _livePausedUntil = DateTime.now().add(const Duration(milliseconds: 1200));
+    _lastScanTokens = tokens; // 다음에 같은 라벨은 바로 찾도록 기억
+    _finish(product.barcode, product);
+  }
+
+  /// 선택 창 닫기 / 다시 읽기
+  void _closePicks() {
+    _resetUnsure();
+    setState(() {
+      _livePicks = null;
+      _liveHint = null;
+    });
+  }
+
+  /// 선택 창에서 "직접 검색"
+  void _searchFromPicks() {
+    final tokens = _recentTokens();
+    _closePicks();
+    _lastScanTokens = tokens;
+    _openProductSearch();
   }
 
   String _zoomLabel(double z) {
@@ -391,11 +555,28 @@ class _ScanScreenState extends State<ScanScreen> {
       if (mounted) setState(() => _focusPoint = null);
     });
     try {
+      // 탭한 곳에 초점을 맞춘 뒤 그대로 고정합니다(가까이서 작은 글자를 찍으면
+      // 자동 초점이 계속 앞뒤로 왔다갔다 해서 글자가 흐려지는 것을 막기 위함).
+      await _controller.setFocusMode(FocusMode.auto);
       await _controller.setFocusPoint(relative);
       await _controller.setExposurePoint(relative);
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      if (!mounted) return;
+      await _controller.setFocusMode(FocusMode.locked);
+      if (mounted) setState(() => _focusLocked = true);
     } catch (_) {
       // 일부 기기/카메라는 지원하지 않을 수 있으므로 무시합니다.
     }
+  }
+
+  /// 초점 고정을 풀고 다시 자동 초점으로 돌아갑니다.
+  Future<void> _unlockFocus() async {
+    setState(() => _focusLocked = false);
+    try {
+      await _controller.setFocusMode(FocusMode.auto);
+      await _controller.setFocusPoint(null);
+      await _controller.setExposurePoint(null);
+    } catch (_) {}
   }
 
   /// 확정된 스캔 결과를 목록에 넣습니다.
@@ -521,7 +702,11 @@ class _ScanScreenState extends State<ScanScreen> {
 
   Future<void> _captureAndRecognize() async {
     if (_isProcessing) return;
-    setState(() => _isProcessing = true);
+    _resetUnsure();
+    setState(() {
+      _isProcessing = true;
+      _livePicks = null;
+    });
     _lastScanTokens = const [];
 
     String? firstPhotoPath;
@@ -1004,12 +1189,99 @@ class _ScanScreenState extends State<ScanScreen> {
     );
   }
 
+  /// 정확히 안 읽힐 때 띄우는 "이 중에 있나요?" 선택 창
+  Widget _buildLivePicks(List<ProductInfo> picks) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surface,
+      elevation: 6,
+      borderRadius: BorderRadius.circular(16),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.45,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 4, 0),
+              child: Row(
+                children: [
+                  Icon(Icons.help_outline, size: 20, color: scheme.primary),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      '정확히 안 읽혀요. 이 중에 있나요?',
+                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    tooltip: '닫기',
+                    onPressed: _closePicks,
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                padding: EdgeInsets.zero,
+                children: [
+                  for (final p in picks)
+                    ListTile(
+                      dense: true,
+                      title: Text(
+                        p.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                      ),
+                      subtitle: Text(
+                        p.variantLabel.isEmpty
+                            ? p.itemNo
+                            : '${p.itemNo} · ${p.variantLabel}',
+                      ),
+                      trailing: Icon(Icons.add_circle, color: scheme.primary),
+                      onTap: () => _pickLive(p),
+                    ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+              child: Row(
+                children: [
+                  TextButton.icon(
+                    onPressed: _closePicks,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('다시 읽기'),
+                  ),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: _searchFromPicks,
+                    icon: const Icon(Icons.search, size: 18),
+                    label: const Text('직접 검색'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   String _hintText() {
     final session = _continuousMode ? '연속 스캔 · 이번에 $_sessionCount개 추가\n' : '';
     if (_liveEnabled && _liveStreamRunning) {
       final reading = _liveHint == null ? '' : '\n읽는 중: $_liveHint';
+      if (_livePicks != null) {
+        return '$session글자가 정확히 안 읽혀요. 아래에서 맞는 상품을 골라주세요';
+      }
       return '$session라벨의 코드를 비추면 자동으로 읽어요'
-          '\n(잘 안 되면 라벨을 펴거나 살짝 기울이고, 셔터를 눌러도 돼요)$reading';
+          '\n(코드를 탭하면 초점이 고정돼요. 2초 넘게 안 읽히면 후보가 떠요)$reading';
     }
     return '$session케어라벨의 코드가 화면 중앙에 크고 선명하게 보이도록 촬영하세요'
         '\n(코드를 탭하면 초점, 너무 가까우면 흐려지니 2x로 조금 떨어져서 찍어보세요)';
@@ -1166,7 +1438,7 @@ class _ScanScreenState extends State<ScanScreen> {
                   ),
                 ),
               ),
-              if (_lastAdded != null)
+              if (_lastAdded != null && _livePicks == null)
                 Align(
                   alignment: Alignment.bottomCenter,
                   child: Padding(
@@ -1216,12 +1488,35 @@ class _ScanScreenState extends State<ScanScreen> {
                     ),
                   ),
                 ),
-              if (_maxZoom > 1.0)
+              if (_maxZoom > 1.0 && _livePicks == null)
                 Align(
                   alignment: Alignment.bottomCenter,
                   child: Padding(
                     padding: const EdgeInsets.only(bottom: 140),
                     child: _buildZoomBar(),
+                  ),
+                ),
+              if (_livePicks != null)
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Padding(
+                    // 촬영 버튼 바로 위에 표시합니다.
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 136),
+                    child: _buildLivePicks(_livePicks!),
+                  ),
+                ),
+              if (_focusLocked)
+                Align(
+                  alignment: Alignment.bottomLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 12, bottom: 56),
+                    // 초점이 고정돼 있다는 표시. 누르면 다시 자동 초점으로 돌아갑니다.
+                    child: ActionChip(
+                      avatar: const Icon(Icons.lock_outline, size: 16),
+                      label: const Text('초점 해제'),
+                      tooltip: '초점 고정 풀기',
+                      onPressed: _unlockFocus,
+                    ),
                   ),
                 ),
               Align(
@@ -1249,4 +1544,13 @@ class _ScanScreenState extends State<ScanScreen> {
       ),
     );
   }
+}
+
+/// 라이브 인식에서 여러 화면에 걸쳐 모은 후보 상품 1개의 점수
+class _LiveVote {
+  final ProductInfo product;
+  double score = 0;
+  int hits = 0;
+
+  _LiveVote(this.product);
 }
